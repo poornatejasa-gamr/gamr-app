@@ -87,8 +87,6 @@ class MainActivity : ComponentActivity() {
                     connectionStatus = status
                     if (status == "Disconnected" || status.startsWith("Connection failed")) {
                         connectedDevice = null
-                        discoveredDevices = emptyList()
-                        hasScanned = false
                     }
                 }
             },
@@ -565,15 +563,20 @@ private fun GamrMatPreview(rows: List<Int>) {
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
         )
-        Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
-            MatOverlayRow(active[0], active[1], active[2])
-            MatOverlayRow(active[3], l3Active || r3Active, active[5]) {
-                Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MatOverlayCell(l3Active, Modifier.weight(1f))
-                    MatOverlayCell(r3Active, Modifier.weight(1f))
-                }
-            }
-            MatOverlayRow(active[6], active[7], active[8])
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            // These bounds follow the printed GAMR regions, not an even 3x3 grid.
+            MatImageOverlayCell(active[0], 0.08f, 0.13f, 0.21f, 0.22f, maxWidth, maxHeight)
+            MatImageOverlayCell(active[1], 0.31f, 0.13f, 0.38f, 0.22f, maxWidth, maxHeight)
+            MatImageOverlayCell(active[2], 0.71f, 0.13f, 0.21f, 0.22f, maxWidth, maxHeight)
+
+            MatImageOverlayCell(active[3], 0.08f, 0.37f, 0.21f, 0.30f, maxWidth, maxHeight)
+            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight)
+            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight)
+            MatImageOverlayCell(active[5], 0.71f, 0.37f, 0.21f, 0.30f, maxWidth, maxHeight)
+
+            MatImageOverlayCell(active[6], 0.08f, 0.70f, 0.21f, 0.22f, maxWidth, maxHeight)
+            MatImageOverlayCell(active[7], 0.31f, 0.70f, 0.38f, 0.22f, maxWidth, maxHeight)
+            MatImageOverlayCell(active[8], 0.71f, 0.70f, 0.21f, 0.22f, maxWidth, maxHeight)
         }
     }
     Text(
@@ -583,23 +586,19 @@ private fun GamrMatPreview(rows: List<Int>) {
 }
 
 @Composable
-private fun ColumnScope.MatOverlayRow(left: Boolean, centre: Boolean, right: Boolean, centreContent: @Composable (() -> Unit)? = null) {
-    Row(
-        modifier = Modifier.weight(1f).fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        MatOverlayCell(left, Modifier.weight(1f))
-        if (centreContent == null) MatOverlayCell(centre, Modifier.weight(1f))
-        else Box(modifier = Modifier.weight(1f)) { centreContent() }
-        MatOverlayCell(right, Modifier.weight(1f))
-    }
-}
-
-@Composable
-private fun MatOverlayCell(active: Boolean, modifier: Modifier = Modifier) {
+private fun MatImageOverlayCell(
+    active: Boolean,
+    left: Float,
+    top: Float,
+    width: Float,
+    height: Float,
+    maxWidth: androidx.compose.ui.unit.Dp,
+    maxHeight: androidx.compose.ui.unit.Dp,
+) {
     Box(
-        modifier = modifier
-            .fillMaxSize()
+        modifier = Modifier
+            .offset(x = maxWidth * left, y = maxHeight * top)
+            .size(width = maxWidth * width, height = maxHeight * height)
             .clip(RoundedCornerShape(16.dp))
             .background(if (active) GamrPurple.copy(alpha = 0.55f) else Color.Transparent),
     )
