@@ -15,6 +15,7 @@ data class GamrDeviceInfo(
     val mode: GamrMode = GamrMode.GAMR,
     val touchThreshold: Int? = null,
     val customActions: List<GamrMatAction> = List(9) { GamrMatAction.DISABLED },
+    val autoShutdownMinutes: Int = 15,
 )
 
 enum class GamrMode(val wireValue: Int, val label: String) {
@@ -62,6 +63,7 @@ class GamrBleClient(
     private var pendingThreshold: Int? = null
     private var pendingCustomAction: Pair<Int, GamrMatAction>? = null
     private var pendingCustomReset = false
+    private var pendingShutdownMinutes: Int? = null
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -126,11 +128,14 @@ class GamrBleClient(
             val threshold = pendingThreshold
             val customAction = pendingCustomAction
             val customReset = pendingCustomReset
-            if (mode == null && threshold == null && customAction == null && !customReset) return
+            val shutdownMinutes = pendingShutdownMinutes
+            if (mode == null && threshold == null && customAction == null && !customReset &&
+                shutdownMinutes == null) return
             pendingMode = null
             pendingThreshold = null
             pendingCustomAction = null
             pendingCustomReset = false
+            pendingShutdownMinutes = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 deviceInfo = when {
                     mode != null -> deviceInfo.copy(mode = mode)
@@ -140,6 +145,7 @@ class GamrBleClient(
                             it[customAction.first] = customAction.second
                         },
                     )
+                    shutdownMinutes != null -> deviceInfo.copy(autoShutdownMinutes = shutdownMinutes)
                     else -> deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) {
                         GamrMatAction.DISABLED
                     })
@@ -276,6 +282,24 @@ class GamrBleClient(
     }
 
     @SuppressLint("MissingPermission")
+    fun setAutoShutdownMinutes(value: Int) {
+        val currentGatt = gatt ?: return
+        val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
+
+        val minutes = value.coerceIn(MIN_SHUTDOWN_MINUTES, MAX_SHUTDOWN_MINUTES)
+        pendingShutdownMinutes = minutes
+        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        characteristic.value = byteArrayOf(CONTROL_CMD_SET_SHUTDOWN_MINUTES, minutes.toByte())
+        if (!currentGatt.writeCharacteristic(characteristic)) {
+            pendingShutdownMinutes = null
+            onStatusChanged("Could not save auto shutdown.")
+        } else {
+            onStatusChanged("Saving auto shutdown...")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun readNextCharacteristic() {
         val currentGatt = gatt ?: return
         if (nextReadIndex >= pendingReads.size) {
@@ -310,6 +334,9 @@ class GamrBleClient(
                                 GamrMatAction.fromWireValue(value[3 + index].toInt() and 0xFF)
                             }
                         } else deviceInfo.customActions,
+                        autoShutdownMinutes = if (value.size >= 4 + CUSTOM_ZONE_COUNT) {
+                            value[3 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
+                        } else deviceInfo.autoShutdownMinutes,
                     )
                 }
             }
@@ -368,10 +395,13 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_MAT_THRESHOLD: Byte = 0x02
         const val CONTROL_CMD_SET_CUSTOM_ACTION: Byte = 0x04
         const val CONTROL_CMD_RESET_CUSTOM_ACTIONS: Byte = 0x05
+        const val CONTROL_CMD_SET_SHUTDOWN_MINUTES: Byte = 0x06
         const val MIN_TOUCH_THRESHOLD = 50
         const val MAX_TOUCH_THRESHOLD = 4095
         const val MAT_ROWS = 5
         const val CUSTOM_ZONE_COUNT = 9
+        const val MIN_SHUTDOWN_MINUTES = 5
+        const val MAX_SHUTDOWN_MINUTES = 60
 
         fun uuid16(value: Int): UUID =
             UUID.fromString("0000%04x-0000-1000-8000-00805f9b34fb".format(value))

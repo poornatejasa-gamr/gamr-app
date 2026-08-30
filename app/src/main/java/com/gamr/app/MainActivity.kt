@@ -112,6 +112,7 @@ class MainActivity : ComponentActivity() {
                     onSensitivitySelected = bleClient::setTouchThreshold,
                     onCustomActionSelected = bleClient::setCustomAction,
                     onCustomReset = bleClient::resetCustomActions,
+                    onShutdownMinutesSelected = bleClient::setAutoShutdownMinutes,
                 )
             }
         }
@@ -173,6 +174,7 @@ private fun GamrHomeScreen(
     onSensitivitySelected: (Int) -> Unit,
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
+    onShutdownMinutesSelected: (Int) -> Unit,
 ) {
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
         LazyColumn(
@@ -197,6 +199,7 @@ private fun GamrHomeScreen(
                         onSensitivitySelected = onSensitivitySelected,
                         onCustomActionSelected = onCustomActionSelected,
                         onCustomReset = onCustomReset,
+                        onShutdownMinutesSelected = onShutdownMinutesSelected,
                     )
                 }
             }
@@ -274,9 +277,13 @@ private fun ConnectedDeviceCard(
     onSensitivitySelected: (Int) -> Unit,
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
+    onShutdownMinutesSelected: (Int) -> Unit,
 ) {
     var sensitivity by remember(info.touchThreshold) {
         mutableFloatStateOf((info.touchThreshold ?: 500).toFloat())
+    }
+    var shutdownMinutes by remember(info.autoShutdownMinutes) {
+        mutableFloatStateOf(info.autoShutdownMinutes.toFloat())
     }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -313,6 +320,21 @@ private fun ConnectedDeviceCard(
                 onValueChange = { sensitivity = it },
                 onValueChangeFinished = { onSensitivitySelected(sensitivity.toInt()) },
                 valueRange = 50f..4095f,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text("AUTO SHUTDOWN", style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("After ${shutdownMinutes.toInt()} minutes without MAT activity",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Slider(
+                value = shutdownMinutes,
+                onValueChange = { shutdownMinutes = it },
+                onValueChangeFinished = {
+                    onShutdownMinutesSelected(shutdownMinutes.toInt())
+                },
+                valueRange = 5f..60f,
+                steps = 54,
             )
             Spacer(Modifier.height(16.dp))
             Text("MAT MODE", style = MaterialTheme.typography.labelLarge,
