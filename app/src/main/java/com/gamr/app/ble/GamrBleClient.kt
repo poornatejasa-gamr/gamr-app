@@ -9,6 +9,7 @@ import android.content.Context
 import java.util.UUID
 
 data class GamrDeviceInfo(
+    val deviceName: String = "-",
     val deviceId: String = "-",
     val firmwareVersion: String = "-",
     val batteryPercentage: Int? = null,
@@ -64,6 +65,7 @@ class GamrBleClient(
     private var pendingCustomAction: Pair<Int, GamrMatAction>? = null
     private var pendingCustomReset = false
     private var pendingShutdownMinutes: Int? = null
+    private var pendingDeviceName: String? = null
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -129,13 +131,15 @@ class GamrBleClient(
             val customAction = pendingCustomAction
             val customReset = pendingCustomReset
             val shutdownMinutes = pendingShutdownMinutes
+            val deviceName = pendingDeviceName
             if (mode == null && threshold == null && customAction == null && !customReset &&
-                shutdownMinutes == null) return
+                shutdownMinutes == null && deviceName == null) return
             pendingMode = null
             pendingThreshold = null
             pendingCustomAction = null
             pendingCustomReset = false
             pendingShutdownMinutes = null
+            pendingDeviceName = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 deviceInfo = when {
                     mode != null -> deviceInfo.copy(mode = mode)
@@ -146,6 +150,7 @@ class GamrBleClient(
                         },
                     )
                     shutdownMinutes != null -> deviceInfo.copy(autoShutdownMinutes = shutdownMinutes)
+                    deviceName != null -> deviceInfo.copy(deviceName = deviceName)
                     else -> deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) {
                         GamrMatAction.DISABLED
                     })
@@ -300,6 +305,29 @@ class GamrBleClient(
     }
 
     @SuppressLint("MissingPermission")
+    fun setDeviceName(value: String) {
+        val name = value.trim()
+        if (!isValidDeviceName(name)) {
+            onStatusChanged("Enter a device name using 1–24 standard characters.")
+            return
+        }
+
+        val currentGatt = gatt ?: return
+        val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
+
+        pendingDeviceName = name
+        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        characteristic.value = byteArrayOf(CONTROL_CMD_SET_DEVICE_NAME) + name.encodeToByteArray()
+        if (!currentGatt.writeCharacteristic(characteristic)) {
+            pendingDeviceName = null
+            onStatusChanged("Could not save device name.")
+        } else {
+            onStatusChanged("Saving device name...")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun readNextCharacteristic() {
         val currentGatt = gatt ?: return
         if (nextReadIndex >= pendingReads.size) {
@@ -337,6 +365,13 @@ class GamrBleClient(
                         autoShutdownMinutes = if (value.size >= 4 + CUSTOM_ZONE_COUNT) {
                             value[3 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
                         } else deviceInfo.autoShutdownMinutes,
+                        deviceName = if (value.size >= 4 + CUSTOM_ZONE_COUNT + 1) {
+                            val nameLength = value[4 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
+                            val nameStart = 5 + CUSTOM_ZONE_COUNT
+                            if (nameLength > 0 && value.size >= nameStart + nameLength) {
+                                value.copyOfRange(nameStart, nameStart + nameLength).decodeToString()
+                            } else deviceInfo.deviceName
+                        } else deviceInfo.deviceName,
                     )
                 }
             }
@@ -396,12 +431,18 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_CUSTOM_ACTION: Byte = 0x04
         const val CONTROL_CMD_RESET_CUSTOM_ACTIONS: Byte = 0x05
         const val CONTROL_CMD_SET_SHUTDOWN_MINUTES: Byte = 0x06
+        const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
         const val MIN_TOUCH_THRESHOLD = 50
         const val MAX_TOUCH_THRESHOLD = 4095
         const val MAT_ROWS = 5
         const val CUSTOM_ZONE_COUNT = 9
         const val MIN_SHUTDOWN_MINUTES = 5
         const val MAX_SHUTDOWN_MINUTES = 60
+        const val MAX_DEVICE_NAME_LENGTH = 24
+
+        fun isValidDeviceName(name: String): Boolean =
+            name.isNotBlank() && name.length <= MAX_DEVICE_NAME_LENGTH &&
+                name.all { it.code in 0x20..0x7E }
 
         fun uuid16(value: Int): UUID =
             UUID.fromString("0000%04x-0000-1000-8000-00805f9b34fb".format(value))

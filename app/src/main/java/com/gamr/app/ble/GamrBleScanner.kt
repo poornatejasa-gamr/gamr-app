@@ -45,8 +45,8 @@ class GamrBleScanner(
         devices.clear()
         onDevicesChanged(emptyList())
 
-        val hidService = ParcelUuid(UUID.fromString("00001812-0000-1000-8000-00805F9B34FB"))
-        val filters = listOf(ScanFilter.Builder().setServiceUuid(hidService).build())
+        val otaService = ParcelUuid(UUID.fromString("0000FFF0-0000-1000-8000-00805F9B34FB"))
+        val filters = listOf(ScanFilter.Builder().setServiceUuid(otaService).build())
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -66,8 +66,7 @@ class GamrBleScanner(
 
     @SuppressLint("MissingPermission")
     private fun addResult(result: ScanResult) {
-        val advertisedName = result.scanRecord?.deviceName ?: result.device.name ?: return
-        if (!isGamrDeviceName(advertisedName)) return
+        val advertisedName = result.scanRecord?.deviceName ?: result.device.name ?: "Unnamed GAMR"
 
         devices[result.device.address] = GamrDevice(
             name = advertisedName,
@@ -78,12 +77,5 @@ class GamrBleScanner(
     }
 
     private companion object {
-        const val GAMR_DEVICE_NAME_PREFIX = "GAMR-"
-        const val LEGACY_DEVICE_NAME = "Poorna_GAMR"
-
-        fun isGamrDeviceName(name: String): Boolean {
-            return name.startsWith(GAMR_DEVICE_NAME_PREFIX, ignoreCase = true) ||
-                name == LEGACY_DEVICE_NAME
-        }
     }
 }

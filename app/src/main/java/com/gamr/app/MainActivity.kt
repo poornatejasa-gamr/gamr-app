@@ -31,6 +31,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
                     onCustomActionSelected = bleClient::setCustomAction,
                     onCustomReset = bleClient::resetCustomActions,
                     onShutdownMinutesSelected = bleClient::setAutoShutdownMinutes,
+                    onDeviceNameSelected = bleClient::setDeviceName,
                 )
             }
         }
@@ -175,6 +177,7 @@ private fun GamrHomeScreen(
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
     onShutdownMinutesSelected: (Int) -> Unit,
+    onDeviceNameSelected: (String) -> Unit,
 ) {
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
         LazyColumn(
@@ -200,6 +203,7 @@ private fun GamrHomeScreen(
                         onCustomActionSelected = onCustomActionSelected,
                         onCustomReset = onCustomReset,
                         onShutdownMinutesSelected = onShutdownMinutesSelected,
+                        onDeviceNameSelected = onDeviceNameSelected,
                     )
                 }
             }
@@ -278,6 +282,7 @@ private fun ConnectedDeviceCard(
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
     onShutdownMinutesSelected: (Int) -> Unit,
+    onDeviceNameSelected: (String) -> Unit,
 ) {
     var sensitivity by remember(info.touchThreshold) {
         mutableFloatStateOf((info.touchThreshold ?: 500).toFloat())
@@ -285,6 +290,12 @@ private fun ConnectedDeviceCard(
     var shutdownMinutes by remember(info.autoShutdownMinutes) {
         mutableFloatStateOf(info.autoShutdownMinutes.toFloat())
     }
+    var nameDraft by remember(info.deviceName, device.name) {
+        mutableStateOf(if (info.deviceName == "-") device.name else info.deviceName)
+    }
+    var nameEdited by remember { mutableStateOf(false) }
+    val nameValid = nameDraft.trim().isNotEmpty() && nameDraft.trim().length <= 24 &&
+        nameDraft.trim().all { it.code in 0x20..0x7E }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -294,7 +305,10 @@ private fun ConnectedDeviceCard(
         Column(modifier = Modifier.padding(20.dp)) {
             Text("CONNECTED MAT", style = MaterialTheme.typography.labelLarge, color = GamrGreen)
             Spacer(Modifier.height(4.dp))
-            Text(device.name, style = MaterialTheme.typography.headlineSmall)
+            Text(
+                if (info.deviceName == "-") device.name else info.deviceName,
+                style = MaterialTheme.typography.headlineSmall,
+            )
             Text(status, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(18.dp))
@@ -309,6 +323,32 @@ private fun ConnectedDeviceCard(
                 DeviceStat("MODE", info.mode.label, Modifier.weight(1f))
                 DeviceStat("SENSITIVITY", info.touchThreshold?.toString() ?: "-", Modifier.weight(1f))
             }
+            Spacer(Modifier.height(16.dp))
+            Text("DEVICE NAME", style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedTextField(
+                value = nameDraft,
+                onValueChange = {
+                    nameDraft = it
+                    nameEdited = true
+                },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                isError = nameEdited && !nameValid,
+                supportingText = {
+                    if (nameEdited && !nameValid) {
+                        Text("A name is required (1–24 standard characters).")
+                    } else {
+                        Text("Shown when the MAT advertises after disconnecting.")
+                    }
+                },
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { onDeviceNameSelected(nameDraft) },
+                enabled = nameValid && nameDraft.trim() != info.deviceName,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("SAVE DEVICE NAME") }
             Spacer(Modifier.height(16.dp))
             Text("TOUCH SENSITIVITY", style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
