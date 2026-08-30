@@ -66,6 +66,7 @@ class GamrBleClient(
     private var pendingCustomReset = false
     private var pendingShutdownMinutes: Int? = null
     private var pendingDeviceName: String? = null
+    private var pendingSystemAction: String? = null
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -132,15 +133,21 @@ class GamrBleClient(
             val customReset = pendingCustomReset
             val shutdownMinutes = pendingShutdownMinutes
             val deviceName = pendingDeviceName
+            val systemAction = pendingSystemAction
             if (mode == null && threshold == null && customAction == null && !customReset &&
-                shutdownMinutes == null && deviceName == null) return
+                shutdownMinutes == null && deviceName == null && systemAction == null) return
             pendingMode = null
             pendingThreshold = null
             pendingCustomAction = null
             pendingCustomReset = false
             pendingShutdownMinutes = null
             pendingDeviceName = null
+            pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                if (systemAction != null) {
+                    onStatusChanged("${systemAction} requested. MAT is restarting...")
+                    return
+                }
                 deviceInfo = when {
                     mode != null -> deviceInfo.copy(mode = mode)
                     threshold != null -> deviceInfo.copy(touchThreshold = threshold)
@@ -327,6 +334,29 @@ class GamrBleClient(
         }
     }
 
+    fun restart() = sendSystemAction(CONTROL_CMD_RESTART, "Restart")
+
+    fun eraseUserData() = sendSystemAction(CONTROL_CMD_ERASE_USER_DATA, "User-data erase")
+
+    fun factoryReset() = sendSystemAction(CONTROL_CMD_FACTORY_RESET, "Factory reset")
+
+    @SuppressLint("MissingPermission")
+    private fun sendSystemAction(command: Byte, label: String) {
+        val currentGatt = gatt ?: return
+        val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
+
+        pendingSystemAction = label
+        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        characteristic.value = byteArrayOf(command)
+        if (!currentGatt.writeCharacteristic(characteristic)) {
+            pendingSystemAction = null
+            onStatusChanged("Could not request $label.")
+        } else {
+            onStatusChanged("Requesting $label...")
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun readNextCharacteristic() {
         val currentGatt = gatt ?: return
@@ -432,6 +462,9 @@ class GamrBleClient(
         const val CONTROL_CMD_RESET_CUSTOM_ACTIONS: Byte = 0x05
         const val CONTROL_CMD_SET_SHUTDOWN_MINUTES: Byte = 0x06
         const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
+        const val CONTROL_CMD_RESTART: Byte = 0x08
+        const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
+        const val CONTROL_CMD_FACTORY_RESET: Byte = 0x0A
         const val MIN_TOUCH_THRESHOLD = 50
         const val MAX_TOUCH_THRESHOLD = 4095
         const val MAT_ROWS = 5
