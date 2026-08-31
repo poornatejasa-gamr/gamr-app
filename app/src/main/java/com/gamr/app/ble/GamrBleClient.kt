@@ -19,7 +19,7 @@ data class GamrDeviceInfo(
     val mode: GamrMode = GamrMode.GAMR,
     val touchThreshold: Int? = null,
     val customActions: List<GamrMatAction> = List(9) { GamrMatAction.DISABLED },
-    val autoShutdownMinutes: Int = 15,
+    val autoShutdownSeconds: Int = 15 * 60,
 )
 
 enum class GamrMode(val wireValue: Int, val label: String) {
@@ -73,7 +73,7 @@ class GamrBleClient(
     private var pendingThreshold: Int? = null
     private var pendingCustomAction: Pair<Int, GamrMatAction>? = null
     private var pendingCustomReset = false
-    private var pendingShutdownMinutes: Int? = null
+    private var pendingShutdownSeconds: Int? = null
     private var pendingDeviceName: String? = null
     private var pendingSystemAction: String? = null
     private var readRetryCount = 0
@@ -175,16 +175,16 @@ class GamrBleClient(
             val threshold = pendingThreshold
             val customAction = pendingCustomAction
             val customReset = pendingCustomReset
-            val shutdownMinutes = pendingShutdownMinutes
+            val shutdownSeconds = pendingShutdownSeconds
             val deviceName = pendingDeviceName
             val systemAction = pendingSystemAction
             if (mode == null && threshold == null && customAction == null && !customReset &&
-                shutdownMinutes == null && deviceName == null && systemAction == null) return
+                shutdownSeconds == null && deviceName == null && systemAction == null) return
             pendingMode = null
             pendingThreshold = null
             pendingCustomAction = null
             pendingCustomReset = false
-            pendingShutdownMinutes = null
+            pendingShutdownSeconds = null
             pendingDeviceName = null
             pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -201,7 +201,7 @@ class GamrBleClient(
                             it[customAction.first] = customAction.second
                         },
                     )
-                    shutdownMinutes != null -> deviceInfo.copy(autoShutdownMinutes = shutdownMinutes)
+                    shutdownSeconds != null -> deviceInfo.copy(autoShutdownSeconds = shutdownSeconds)
                     deviceName != null -> deviceInfo.copy(deviceName = deviceName)
                     else -> deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) {
                         GamrMatAction.DISABLED
@@ -349,17 +349,21 @@ class GamrBleClient(
     }
 
     @SuppressLint("MissingPermission")
-    fun setAutoShutdownMinutes(value: Int) {
+    fun setAutoShutdownSeconds(value: Int) {
         val currentGatt = gatt ?: return
         val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
-        val minutes = value.coerceIn(MIN_SHUTDOWN_MINUTES, MAX_SHUTDOWN_MINUTES)
-        pendingShutdownMinutes = minutes
+        val seconds = value.coerceIn(MIN_SHUTDOWN_SECONDS, MAX_SHUTDOWN_SECONDS)
+        pendingShutdownSeconds = seconds
         characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(CONTROL_CMD_SET_SHUTDOWN_MINUTES, minutes.toByte())
+        characteristic.value = byteArrayOf(
+            CONTROL_CMD_SET_SHUTDOWN_SECONDS,
+            (seconds and 0xFF).toByte(),
+            ((seconds shr 8) and 0xFF).toByte(),
+        )
         if (!currentGatt.writeCharacteristic(characteristic)) {
-            pendingShutdownMinutes = null
+            pendingShutdownSeconds = null
             reportStatus("Could not save auto shutdown.")
         } else {
             reportStatus("Saving auto shutdown...")
@@ -461,9 +465,18 @@ class GamrBleClient(
                                 GamrMatAction.fromWireValue(value[3 + index].toInt() and 0xFF)
                             }
                         } else deviceInfo.customActions,
-                        autoShutdownMinutes = if (value.size >= 4 + CUSTOM_ZONE_COUNT) {
-                            value[3 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
-                        } else deviceInfo.autoShutdownMinutes,
+                        autoShutdownSeconds = if (value.size >= 4 + CUSTOM_ZONE_COUNT) {
+                            val legacyMinutes = value[3 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
+                            val nameLengthOffset = 4 + CUSTOM_ZONE_COUNT
+                            val nameLength = value.getOrNull(nameLengthOffset)?.toInt()?.and(0xFF) ?: 0
+                            val secondsOffset = nameLengthOffset + 1 + nameLength
+                            if (value.size >= secondsOffset + 2) {
+                                (value[secondsOffset].toInt() and 0xFF) or
+                                    ((value[secondsOffset + 1].toInt() and 0xFF) shl 8)
+                            } else {
+                                legacyMinutes * 60
+                            }
+                        } else deviceInfo.autoShutdownSeconds,
                         deviceName = if (value.size >= 4 + CUSTOM_ZONE_COUNT + 1) {
                             val nameLength = value[4 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
                             val nameStart = 5 + CUSTOM_ZONE_COUNT
@@ -597,17 +610,17 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_MAT_THRESHOLD: Byte = 0x02
         const val CONTROL_CMD_SET_CUSTOM_ACTION: Byte = 0x04
         const val CONTROL_CMD_RESET_CUSTOM_ACTIONS: Byte = 0x05
-        const val CONTROL_CMD_SET_SHUTDOWN_MINUTES: Byte = 0x06
+        const val CONTROL_CMD_SET_SHUTDOWN_SECONDS: Byte = 0x0B
         const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
         const val CONTROL_CMD_RESTART: Byte = 0x08
         const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
         const val CONTROL_CMD_FACTORY_RESET: Byte = 0x0A
         const val MIN_TOUCH_THRESHOLD = 50
-        const val MAX_TOUCH_THRESHOLD = 4095
+        const val MAX_TOUCH_THRESHOLD = 1000
         const val MAT_ROWS = 5
         const val CUSTOM_ZONE_COUNT = 9
-        const val MIN_SHUTDOWN_MINUTES = 5
-        const val MAX_SHUTDOWN_MINUTES = 60
+        const val MIN_SHUTDOWN_SECONDS = 30
+        const val MAX_SHUTDOWN_SECONDS = 60 * 60
         const val MAX_DEVICE_NAME_LENGTH = 24
         const val SERVICE_DISCOVERY_DELAY_MS = 600L
         const val SERVICE_SETTLE_DELAY_MS = 250L

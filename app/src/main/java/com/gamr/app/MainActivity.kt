@@ -4,8 +4,11 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.InputDevice
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -43,6 +46,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.gamr.app.ble.GamrBleClient
@@ -69,6 +74,7 @@ class MainActivity : ComponentActivity() {
     private var matRows by mutableStateOf(List(5) { 0 })
     private var hasScanned by mutableStateOf(false)
     private var activeBleSession = 0L
+    private var consumeMatGamepadKeys = false
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -126,11 +132,12 @@ class MainActivity : ComponentActivity() {
                     onSensitivitySelected = bleClient::setTouchThreshold,
                     onCustomActionSelected = bleClient::setCustomAction,
                     onCustomReset = bleClient::resetCustomActions,
-                    onShutdownMinutesSelected = bleClient::setAutoShutdownMinutes,
+                    onShutdownSecondsSelected = bleClient::setAutoShutdownSeconds,
                     onDeviceNameSelected = bleClient::setDeviceName,
                     onRestart = bleClient::restart,
                     onEraseUserData = bleClient::eraseUserData,
                     onFactoryReset = bleClient::factoryReset,
+                    onPreviewVisibilityChanged = { consumeMatGamepadKeys = it },
                 )
             }
         }
@@ -154,6 +161,7 @@ class MainActivity : ComponentActivity() {
 
     private fun returnToScan() {
         activeBleSession++
+        consumeMatGamepadKeys = false
         connectedDevice = null
         discoveredDevices = emptyList()
         matRows = List(5) { 0 }
@@ -164,6 +172,7 @@ class MainActivity : ComponentActivity() {
 
     private fun connectToDevice(device: GamrDevice) {
         scanner.stop()
+        consumeMatGamepadKeys = false
         connectedDevice = device
         deviceInfo = GamrDeviceInfo()
         matRows = List(5) { 0 }
@@ -173,6 +182,16 @@ class MainActivity : ComponentActivity() {
 
     private fun disconnect() {
         bleClient.disconnect()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val gamepadSource = event.source and
+            (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK or InputDevice.SOURCE_DPAD)
+
+        if (consumeMatGamepadKeys && gamepadSource != 0) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     private fun hasBluetoothPermissions(): Boolean {
@@ -207,12 +226,31 @@ private fun GamrHomeScreen(
     onSensitivitySelected: (Int) -> Unit,
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
-    onShutdownMinutesSelected: (Int) -> Unit,
+    onShutdownSecondsSelected: (Int) -> Unit,
     onDeviceNameSelected: (String) -> Unit,
     onRestart: () -> Unit,
     onEraseUserData: () -> Unit,
     onFactoryReset: () -> Unit,
+    onPreviewVisibilityChanged: (Boolean) -> Unit,
 ) {
+    var connectedView by remember(connectedDevice?.address) { mutableStateOf(ConnectedView.DASHBOARD) }
+    var previewMode by remember(connectedDevice?.address) { mutableStateOf(deviceInfo.mode) }
+
+    BackHandler(enabled = connectedDevice != null) {
+        when (connectedView) {
+            ConnectedView.MODE_PREVIEW -> {
+                connectedView = ConnectedView.CONFIGURATION
+                onPreviewVisibilityChanged(false)
+            }
+            ConnectedView.CONFIGURATION -> connectedView = ConnectedView.DASHBOARD
+            ConnectedView.DASHBOARD -> {
+                onPreviewVisibilityChanged(false)
+                onReturnToScan()
+                onDisconnectClick()
+            }
+        }
+    }
+
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -221,30 +259,69 @@ private fun GamrHomeScreen(
                 .padding(horizontal = 20.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            item { Spacer(Modifier.height(6.dp)) }
-            item { GamrHero(connectedDevice != null && connectionStatus == "Connected") }
-
             if (connectedDevice != null) {
-                item {
-                    ConnectedDeviceCard(
-                        device = connectedDevice,
-                        status = connectionStatus,
-                        info = deviceInfo,
-                        matRows = matRows,
-                        onDisconnectClick = onDisconnectClick,
-                        onReturnToScan = onReturnToScan,
-                        onModeSelected = onModeSelected,
-                        onSensitivitySelected = onSensitivitySelected,
-                        onCustomActionSelected = onCustomActionSelected,
-                        onCustomReset = onCustomReset,
-                        onShutdownMinutesSelected = onShutdownMinutesSelected,
-                        onDeviceNameSelected = onDeviceNameSelected,
-                        onRestart = onRestart,
-                        onEraseUserData = onEraseUserData,
-                        onFactoryReset = onFactoryReset,
-                    )
+                when (connectedView) {
+                    ConnectedView.DASHBOARD -> {
+                        item { Spacer(Modifier.height(6.dp)) }
+                        item { GamrHero(connectionStatus == "Connected") }
+                        item {
+                            ConnectedDashboard(
+                                device = connectedDevice,
+                                status = connectionStatus,
+                                info = deviceInfo,
+                                onConfigure = { connectedView = ConnectedView.CONFIGURATION },
+                                onRestart = onRestart,
+                                onEraseUserData = onEraseUserData,
+                                onFactoryReset = onFactoryReset,
+                                onReturnToScan = onReturnToScan,
+                                onDisconnect = {
+                                    onPreviewVisibilityChanged(false)
+                                    onReturnToScan()
+                                    onDisconnectClick()
+                                },
+                            )
+                        }
+                    }
+                    ConnectedView.CONFIGURATION -> item {
+                        ConfigurationPanel(
+                            device = connectedDevice,
+                            info = deviceInfo,
+                            onBack = { connectedView = ConnectedView.DASHBOARD },
+                            onModeSelected = { mode ->
+                                previewMode = mode
+                                onModeSelected(mode)
+                                if (mode != GamrMode.CUSTOM) {
+                                    connectedView = ConnectedView.MODE_PREVIEW
+                                    onPreviewVisibilityChanged(true)
+                                }
+                            },
+                            onOpenModePreview = { mode ->
+                                previewMode = mode
+                                connectedView = ConnectedView.MODE_PREVIEW
+                                onPreviewVisibilityChanged(true)
+                            },
+                            onSensitivitySelected = onSensitivitySelected,
+                            onShutdownSecondsSelected = onShutdownSecondsSelected,
+                            onDeviceNameSelected = onDeviceNameSelected,
+                            onCustomActionSelected = onCustomActionSelected,
+                            onCustomReset = onCustomReset,
+                        )
+                    }
+                    ConnectedView.MODE_PREVIEW -> item {
+                        ModePreviewPanel(
+                            mode = previewMode,
+                            info = deviceInfo,
+                            matRows = matRows,
+                            onBack = {
+                                connectedView = ConnectedView.CONFIGURATION
+                                onPreviewVisibilityChanged(false)
+                            },
+                        )
+                    }
                 }
             } else {
+                item { Spacer(Modifier.height(6.dp)) }
+                item { GamrHero(false) }
                 item {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
@@ -305,72 +382,6 @@ private fun GamrHero(connected: Boolean) {
     }
 }
 
-@Composable
-private fun ConnectedDeviceCard(
-    device: GamrDevice,
-    status: String,
-    info: GamrDeviceInfo,
-    matRows: List<Int>,
-    onDisconnectClick: () -> Unit,
-    onReturnToScan: () -> Unit,
-    onModeSelected: (GamrMode) -> Unit,
-    onSensitivitySelected: (Int) -> Unit,
-    onCustomActionSelected: (Int, GamrMatAction) -> Unit,
-    onCustomReset: () -> Unit,
-    onShutdownMinutesSelected: (Int) -> Unit,
-    onDeviceNameSelected: (String) -> Unit,
-    onRestart: () -> Unit,
-    onEraseUserData: () -> Unit,
-    onFactoryReset: () -> Unit,
-) {
-    var view by remember(device.address) { mutableStateOf(ConnectedView.DASHBOARD) }
-    var previewMode by remember(device.address) { mutableStateOf(info.mode) }
-
-    when (view) {
-        ConnectedView.DASHBOARD -> ConnectedDashboard(
-            device = device,
-            status = status,
-            info = info,
-            onConfigure = { view = ConnectedView.CONFIGURATION },
-            onRestart = onRestart,
-            onEraseUserData = onEraseUserData,
-            onFactoryReset = onFactoryReset,
-            onReturnToScan = onReturnToScan,
-            onDisconnect = {
-                onReturnToScan()
-                onDisconnectClick()
-            },
-        )
-        ConnectedView.CONFIGURATION -> ConfigurationPanel(
-            device = device,
-            info = info,
-            onBack = { view = ConnectedView.DASHBOARD },
-            onModeSelected = {
-                previewMode = it
-                onModeSelected(it)
-                if (it != GamrMode.CUSTOM) {
-                    view = ConnectedView.MODE_PREVIEW
-                }
-            },
-            onOpenModePreview = {
-                previewMode = it
-                view = ConnectedView.MODE_PREVIEW
-            },
-            onSensitivitySelected = onSensitivitySelected,
-            onShutdownMinutesSelected = onShutdownMinutesSelected,
-            onDeviceNameSelected = onDeviceNameSelected,
-            onCustomActionSelected = onCustomActionSelected,
-            onCustomReset = onCustomReset,
-        )
-        ConnectedView.MODE_PREVIEW -> ModePreviewPanel(
-            mode = previewMode,
-            info = info,
-            matRows = matRows,
-            onBack = { view = ConnectedView.CONFIGURATION },
-        )
-    }
-}
-
 private enum class ConnectedView { DASHBOARD, CONFIGURATION, MODE_PREVIEW }
 
 @Composable
@@ -406,19 +417,39 @@ private fun ConnectedDashboard(
             Spacer(Modifier.height(4.dp))
             Button(onClick = onConfigure, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = GamrPurple)) { Text("CONFIGURATION") }
-            OutlinedButton(onClick = { confirmation = "Update" }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { confirmation = "Update" }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = GamrPurple,
+                    contentColor = Color.Black,
+                )) {
                 Text("UPDATE")
             }
-            OutlinedButton(onClick = { confirmation = "Restart" }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { confirmation = "Restart" }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = GamrPurple,
+                    contentColor = Color.Black,
+                )) {
                 Text("RESTART")
             }
-            OutlinedButton(onClick = { confirmation = "Erase user data" }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { confirmation = "Erase user data" }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = GamrPurple,
+                    contentColor = Color.Black,
+                )) {
                 Text("ERASE USER DATA")
             }
-            OutlinedButton(onClick = { confirmation = "Factory reset" }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { confirmation = "Factory reset" }, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = GamrPurple,
+                    contentColor = Color.Black,
+                )) {
                 Text("FACTORY RESET")
             }
-            OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("DISCONNECT") }
+            OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = GamrPurple,
+                    contentColor = Color.Black,
+                )) { Text("DISCONNECT") }
         }
     }
 
@@ -497,13 +528,15 @@ private fun ConfigurationPanel(
     onModeSelected: (GamrMode) -> Unit,
     onOpenModePreview: (GamrMode) -> Unit,
     onSensitivitySelected: (Int) -> Unit,
-    onShutdownMinutesSelected: (Int) -> Unit,
+    onShutdownSecondsSelected: (Int) -> Unit,
     onDeviceNameSelected: (String) -> Unit,
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
 ) {
-    var sensitivity by remember(info.touchThreshold) { mutableFloatStateOf((info.touchThreshold ?: 500).toFloat()) }
-    var timeout by remember(info.autoShutdownMinutes) { mutableFloatStateOf(info.autoShutdownMinutes.toFloat()) }
+    var sensitivity by remember(info.touchThreshold) {
+        mutableFloatStateOf((info.touchThreshold ?: 500).coerceIn(50, 1000).toFloat())
+    }
+    var timeout by remember(info.autoShutdownSeconds) { mutableFloatStateOf(info.autoShutdownSeconds.toFloat()) }
     var nameDraft by remember(info.deviceName, device.name) {
         mutableStateOf(if (info.deviceName == "-") device.name else info.deviceName)
     }
@@ -512,9 +545,8 @@ private fun ConfigurationPanel(
     val nameValid = nameDraft.trim().isNotEmpty() && nameDraft.trim().length <= 24 &&
         nameDraft.trim().all { it.code in 0x20..0x7E }
 
-    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
-        Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            BackButton(label = "BACK", onClick = onBack)
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            BackButton(label = "BACK TO DASHBOARD", onClick = onBack)
             Text("CONFIGURATION", style = MaterialTheme.typography.headlineSmall)
             Text("DEVICE NAME", style = MaterialTheme.typography.labelLarge)
             OutlinedTextField(
@@ -531,11 +563,11 @@ private fun ConfigurationPanel(
                 modifier = Modifier.fillMaxWidth()) { Text("SAVE DEVICE NAME") }
             Text("TOUCH SENSITIVITY · ${sensitivity.toInt()}", style = MaterialTheme.typography.labelLarge)
             Slider(value = sensitivity, onValueChange = { sensitivity = it },
-                onValueChangeFinished = { onSensitivitySelected(sensitivity.toInt()) }, valueRange = 50f..4095f)
-            Text("AUTO SHUTDOWN · ${timeout.toInt()} MIN", style = MaterialTheme.typography.labelLarge)
+                onValueChangeFinished = { onSensitivitySelected(sensitivity.toInt()) }, valueRange = 50f..1000f)
+            Text("AUTO SHUTDOWN · ${formatShutdownTimeout(timeout.toInt())}", style = MaterialTheme.typography.labelLarge)
             Slider(value = timeout, onValueChange = { timeout = it },
-                onValueChangeFinished = { onShutdownMinutesSelected(timeout.toInt()) },
-                valueRange = 5f..60f, steps = 54)
+                onValueChangeFinished = { onShutdownSecondsSelected(timeout.toInt()) },
+                valueRange = 30f..3600f, steps = 118)
             Text("MAT MODES", style = MaterialTheme.typography.labelLarge, color = GamrCyan)
             GamrMode.entries.chunked(2).forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -558,24 +590,25 @@ private fun ConfigurationPanel(
                 OutlinedButton(onClick = { onOpenModePreview(GamrMode.CUSTOM) },
                     modifier = Modifier.fillMaxWidth()) { Text("VIEW LIVE CUSTOM MAT") }
             }
-        }
     }
+}
+
+private fun formatShutdownTimeout(seconds: Int): String {
+    return if (seconds < 60) "$seconds SEC" else "${seconds / 60} MIN"
 }
 
 @Composable
 private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List<Int>, onBack: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
-        Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            BackButton(label = "CONFIGURATION", onClick = onBack)
-            Text("${mode.label} · LIVE MAT", style = MaterialTheme.typography.headlineSmall)
-            Text("Press the physical MAT; active regions light up below.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            when (mode) {
-                GamrMode.GAMR -> GamrMatPreview(matRows)
-                GamrMode.RHYTHM -> RhythmMatPreview(matRows)
-                GamrMode.BALANCE -> BalanceMatPreview(matRows)
-                GamrMode.CUSTOM -> CustomMatPreview(info, matRows)
-            }
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        BackButton(label = "BACK TO CONFIGURATION", onClick = onBack)
+        Text("${mode.label} · LIVE MAT", style = MaterialTheme.typography.headlineSmall)
+        Text("Press the physical MAT; active regions light up below.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        when (mode) {
+            GamrMode.GAMR -> GamrMatPreview(matRows)
+            GamrMode.RHYTHM -> RhythmMatPreview(matRows)
+            GamrMode.BALANCE -> BalanceMatPreview(matRows)
+            GamrMode.CUSTOM -> CustomMatPreview(info, matRows)
         }
     }
 }
@@ -590,9 +623,17 @@ private fun GamrMatPreview(rows: List<Int>) {
 
     MatImagePreview {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            StandardMatOverlays(outerZones, List(9) { "" }, GamrPurple, maxWidth, maxHeight)
-            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight, GamrPurple, "L3")
-            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight, GamrPurple, "R3")
+            StandardMatOverlays(
+                active = outerZones,
+                labels = listOf("X", "UP", "A", "LEFT", "", "RIGHT", "Y", "DOWN", "B"),
+                tint = GamrPurple,
+                maxWidth = maxWidth,
+                maxHeight = maxHeight,
+            )
+            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
+                maxWidth, maxHeight, GamrPurple, "L3")
+            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f,
+                maxWidth, maxHeight, GamrPurple, "R3")
         }
     }
     PressedActions(pressed)
@@ -604,7 +645,10 @@ private fun RhythmMatPreview(rows: List<Int>) {
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
     MatImagePreview {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            StandardMatOverlays(active, labels, Color(0xFFFF8A3D), maxWidth, maxHeight)
+            StandardMatOverlays(
+                active, labels, Color(0xFFFF8A3D), maxWidth, maxHeight,
+                emphasizeLabel = true,
+            )
         }
     }
     PressedActions(labels.filterIndexed { index, _ -> active[index] })
@@ -645,6 +689,7 @@ private fun BalanceMatPreview(rows: List<Int>) {
                         maxHeight = maxHeight,
                         tint = GamrGreen,
                         label = labels[index],
+                        emphasizeLabel = true,
                     )
                 }
             }
@@ -678,6 +723,7 @@ private fun StandardMatOverlays(
     tint: Color,
     maxWidth: androidx.compose.ui.unit.Dp,
     maxHeight: androidx.compose.ui.unit.Dp,
+    emphasizeLabel: Boolean = false,
 ) {
     val regions = listOf(
         floatArrayOf(0.08f, 0.13f, 0.21f, 0.22f),
@@ -696,6 +742,7 @@ private fun StandardMatOverlays(
             left = region[0], top = region[1], width = region[2], height = region[3],
             maxWidth = maxWidth, maxHeight = maxHeight, tint = tint,
             label = labels.getOrElse(index) { "" },
+            emphasizeLabel = emphasizeLabel,
         )
     }
 }
@@ -711,6 +758,7 @@ private fun MatImageOverlayCell(
     maxHeight: androidx.compose.ui.unit.Dp,
     tint: Color,
     label: String,
+    emphasizeLabel: Boolean = false,
 ) {
     Box(
         modifier = Modifier
@@ -721,7 +769,13 @@ private fun MatImageOverlayCell(
         contentAlignment = Alignment.Center,
     ) {
         if (active && label.isNotEmpty()) {
-            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White)
+            Text(
+                text = label,
+                style = if (emphasizeLabel) MaterialTheme.typography.titleLarge
+                    else MaterialTheme.typography.labelLarge,
+                fontWeight = if (emphasizeLabel) FontWeight.Bold else FontWeight.Normal,
+                color = Color.White,
+            )
         }
     }
 }
@@ -786,11 +840,27 @@ private fun CustomMappingEditor(
                     Box(modifier = Modifier.weight(1f)) {
                         OutlinedButton(
                             onClick = { expandedZone = zone },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 64.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
                         ) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(zones[zone], style = MaterialTheme.typography.labelSmall)
-                                Text(action.label, style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    text = zones[zone],
+                                    style = MaterialTheme.typography.labelSmall,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = action.label,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
                         }
                         DropdownMenu(
