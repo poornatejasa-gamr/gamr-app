@@ -55,6 +55,7 @@ import com.gamr.app.ble.GamrBleScanner
 import com.gamr.app.ble.GamrDevice
 import com.gamr.app.ble.GamrDeviceInfo
 import com.gamr.app.ble.GamrDeviceSource
+import com.gamr.app.ble.GamrInputProfile
 import com.gamr.app.ble.GamrMode
 import com.gamr.app.ble.GamrMatAction
 import com.gamr.app.ui.theme.GamrCyan
@@ -74,7 +75,7 @@ class MainActivity : ComponentActivity() {
     private var matRows by mutableStateOf(List(5) { 0 })
     private var hasScanned by mutableStateOf(false)
     private var activeBleSession = 0L
-    private var consumeMatGamepadKeys = false
+    private var consumeMatHidKeys = false
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -129,6 +130,7 @@ class MainActivity : ComponentActivity() {
                     onDisconnectClick = ::disconnect,
                     onReturnToScan = ::returnToScan,
                     onModeSelected = bleClient::setMode,
+                    onInputProfileSelected = bleClient::setInputProfile,
                     onSensitivitySelected = bleClient::setTouchThreshold,
                     onCustomActionSelected = bleClient::setCustomAction,
                     onCustomReset = bleClient::resetCustomActions,
@@ -137,7 +139,7 @@ class MainActivity : ComponentActivity() {
                     onRestart = bleClient::restart,
                     onEraseUserData = bleClient::eraseUserData,
                     onFactoryReset = bleClient::factoryReset,
-                    onPreviewVisibilityChanged = { consumeMatGamepadKeys = it },
+                    onPreviewVisibilityChanged = { consumeMatHidKeys = it },
                 )
             }
         }
@@ -161,7 +163,7 @@ class MainActivity : ComponentActivity() {
 
     private fun returnToScan() {
         activeBleSession++
-        consumeMatGamepadKeys = false
+        consumeMatHidKeys = false
         connectedDevice = null
         discoveredDevices = emptyList()
         matRows = List(5) { 0 }
@@ -172,7 +174,7 @@ class MainActivity : ComponentActivity() {
 
     private fun connectToDevice(device: GamrDevice) {
         scanner.stop()
-        consumeMatGamepadKeys = false
+        consumeMatHidKeys = false
         connectedDevice = device
         deviceInfo = GamrDeviceInfo()
         matRows = List(5) { 0 }
@@ -187,8 +189,11 @@ class MainActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val gamepadSource = event.source and
             (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK or InputDevice.SOURCE_DPAD)
+        val keyboardSource = event.source and InputDevice.SOURCE_KEYBOARD
+        val matKeyboardKey = isMatKeyboardKey(event.keyCode)
 
-        if (consumeMatGamepadKeys && gamepadSource != 0) {
+        if (consumeMatHidKeys && (gamepadSource != 0 ||
+                (keyboardSource != 0 && matKeyboardKey))) {
             return true
         }
         return super.dispatchKeyEvent(event)
@@ -209,6 +214,19 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun isMatKeyboardKey(keyCode: Int): Boolean = when (keyCode) {
+    KeyEvent.KEYCODE_ESCAPE,
+    KeyEvent.KEYCODE_DPAD_UP,
+    KeyEvent.KEYCODE_DEL,
+    KeyEvent.KEYCODE_DPAD_LEFT,
+    KeyEvent.KEYCODE_SPACE,
+    KeyEvent.KEYCODE_DPAD_RIGHT,
+    KeyEvent.KEYCODE_TAB,
+    KeyEvent.KEYCODE_DPAD_DOWN,
+    KeyEvent.KEYCODE_ENTER -> true
+    else -> false
+}
+
 @Composable
 private fun GamrHomeScreen(
     scanStatus: String,
@@ -223,6 +241,7 @@ private fun GamrHomeScreen(
     onDisconnectClick: () -> Unit,
     onReturnToScan: () -> Unit,
     onModeSelected: (GamrMode) -> Unit,
+    onInputProfileSelected: (GamrInputProfile) -> Unit,
     onSensitivitySelected: (Int) -> Unit,
     onCustomActionSelected: (Int, GamrMatAction) -> Unit,
     onCustomReset: () -> Unit,
@@ -295,6 +314,7 @@ private fun GamrHomeScreen(
                                     onPreviewVisibilityChanged(true)
                                 }
                             },
+                            onInputProfileSelected = onInputProfileSelected,
                             onOpenModePreview = { mode ->
                                 previewMode = mode
                                 connectedView = ConnectedView.MODE_PREVIEW
@@ -413,6 +433,7 @@ private fun ConnectedDashboard(
             DeviceStat("BATTERY", info.batteryPercentage?.let { "$it%" } ?: "-", Modifier.fillMaxWidth())
             DeviceStat("FIRMWARE", info.firmwareVersion, Modifier.fillMaxWidth())
             DeviceStat("MODE", info.mode.label, Modifier.fillMaxWidth())
+            DeviceStat("INPUT PROFILE", info.inputProfile.label, Modifier.fillMaxWidth())
             DeviceStat("SENSITIVITY", info.touchThreshold?.toString() ?: "-", Modifier.fillMaxWidth())
             Spacer(Modifier.height(4.dp))
             Button(onClick = onConfigure, modifier = Modifier.fillMaxWidth(),
@@ -477,7 +498,7 @@ private fun ConnectedDashboard(
         )
         "Factory reset" -> ActionDialog(
             title = "Factory reset MAT?",
-            message = "This clears Bluetooth bonds, the custom name, MAT mode, sensitivity, Custom mapping, and auto-shutdown setting. Firmware remains installed.",
+            message = "This clears Bluetooth bonds, the custom name, MAT mode, input profile, sensitivity, Custom mapping, and auto-shutdown setting. Firmware remains installed.",
             confirmLabel = "Reset",
             onConfirm = { confirmation = null; onReturnToScan(); onFactoryReset() },
             onDismiss = { confirmation = null },
@@ -526,6 +547,7 @@ private fun ConfigurationPanel(
     info: GamrDeviceInfo,
     onBack: () -> Unit,
     onModeSelected: (GamrMode) -> Unit,
+    onInputProfileSelected: (GamrInputProfile) -> Unit,
     onOpenModePreview: (GamrMode) -> Unit,
     onSensitivitySelected: (Int) -> Unit,
     onShutdownSecondsSelected: (Int) -> Unit,
@@ -542,6 +564,7 @@ private fun ConfigurationPanel(
     }
     var nameEdited by remember { mutableStateOf(false) }
     var selectedMode by remember(info.mode) { mutableStateOf(info.mode) }
+    var selectedProfile by remember(info.inputProfile) { mutableStateOf(info.inputProfile) }
     val nameValid = nameDraft.trim().isNotEmpty() && nameDraft.trim().length <= 24 &&
         nameDraft.trim().all { it.code in 0x20..0x7E }
 
@@ -568,6 +591,22 @@ private fun ConfigurationPanel(
             Slider(value = timeout, onValueChange = { timeout = it },
                 onValueChangeFinished = { onShutdownSecondsSelected(timeout.toInt()) },
                 valueRange = 30f..3600f, steps = 118)
+            Text("INPUT PROFILE", style = MaterialTheme.typography.labelLarge, color = GamrCyan)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GamrInputProfile.entries.forEach { profile ->
+                    val selected = profile == selectedProfile
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            selectedProfile = profile
+                            onInputProfileSelected(profile)
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (selected) GamrGreen else GamrPurple,
+                        ),
+                    ) { Text(profile.label) }
+                }
+            }
             Text("MAT MODES", style = MaterialTheme.typography.labelLarge, color = GamrCyan)
             GamrMode.entries.chunked(2).forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -605,7 +644,7 @@ private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List
         Text("Press the physical MAT; active regions light up below.",
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         when (mode) {
-            GamrMode.GAMR -> GamrMatPreview(matRows)
+            GamrMode.GAMR -> GamrMatPreview(matRows, info.inputProfile)
             GamrMode.RHYTHM -> RhythmMatPreview(matRows)
             GamrMode.BALANCE -> BalanceMatPreview(matRows)
             GamrMode.CUSTOM -> CustomMatPreview(info, matRows)
@@ -614,26 +653,38 @@ private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List
 }
 
 @Composable
-private fun GamrMatPreview(rows: List<Int>) {
+private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
     val outerZones = active.toMutableList().also { it[4] = false }
+    val centerActive = (1..3).any { row -> rowPressed(rows, row, 2) }
     val l3Active = (1..3).any { row -> rowPressed(rows, row, 1) }
     val r3Active = (1..3).any { row -> rowPressed(rows, row, 3) }
-    val pressed = gamrActions(rows)
+    val keyboard = profile == GamrInputProfile.KEYBOARD
+    val labels = if (keyboard) {
+        listOf("ESC", "UP", "BKSP", "LEFT", "", "RIGHT", "TAB", "DOWN", "ENTER")
+    } else {
+        listOf("X", "UP", "A", "LEFT", "", "RIGHT", "Y", "DOWN", "B")
+    }
+    val pressed = if (keyboard) gamrKeyboardActions(rows) else gamrActions(rows)
 
     MatImagePreview {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             StandardMatOverlays(
                 active = outerZones,
-                labels = listOf("X", "UP", "A", "LEFT", "", "RIGHT", "Y", "DOWN", "B"),
+                labels = labels,
                 tint = GamrPurple,
                 maxWidth = maxWidth,
                 maxHeight = maxHeight,
             )
-            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
-                maxWidth, maxHeight, GamrPurple, "L3")
-            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f,
-                maxWidth, maxHeight, GamrPurple, "R3")
+            if (keyboard) {
+                MatImageOverlayCell(centerActive, 0.45f, 0.40f, 0.10f, 0.25f,
+                    maxWidth, maxHeight, GamrPurple, "SPACE")
+            } else {
+                MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
+                    maxWidth, maxHeight, GamrPurple, "L3")
+                MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f,
+                    maxWidth, maxHeight, GamrPurple, "R3")
+            }
         }
     }
     PressedActions(pressed)
@@ -814,6 +865,21 @@ private fun gamrActions(rows: List<Int>): List<String> {
         if (cell(4, 0)) add("Y")
         if ((1..3).any { cell(4, it) }) add("Down")
         if (cell(4, 4)) add("B")
+    }
+}
+
+private fun gamrKeyboardActions(rows: List<Int>): List<String> {
+    fun cell(row: Int, column: Int) = rowPressed(rows, row, column)
+    return buildList {
+        if (cell(0, 0)) add("Esc")
+        if ((1..3).any { cell(0, it) }) add("Up")
+        if (cell(0, 4)) add("Backspace")
+        if ((1..3).any { cell(it, 0) }) add("Left")
+        if ((1..3).any { cell(it, 2) }) add("Space")
+        if ((1..3).any { cell(it, 4) }) add("Right")
+        if (cell(4, 0)) add("Tab")
+        if ((1..3).any { cell(4, it) }) add("Down")
+        if (cell(4, 4)) add("Enter")
     }
 }
 

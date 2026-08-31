@@ -20,7 +20,19 @@ data class GamrDeviceInfo(
     val touchThreshold: Int? = null,
     val customActions: List<GamrMatAction> = List(9) { GamrMatAction.DISABLED },
     val autoShutdownSeconds: Int = 15 * 60,
+    val inputProfile: GamrInputProfile = GamrInputProfile.GAMEPAD,
 )
+
+enum class GamrInputProfile(val wireValue: Int, val label: String) {
+    GAMEPAD(0, "Gamepad"),
+    KEYBOARD(1, "Keyboard");
+
+    companion object {
+        fun fromWireValue(value: Int): GamrInputProfile = entries.firstOrNull {
+            it.wireValue == value
+        } ?: GAMEPAD
+    }
+}
 
 enum class GamrMode(val wireValue: Int, val label: String) {
     GAMR(0, "GAMR"),
@@ -74,6 +86,7 @@ class GamrBleClient(
     private var pendingCustomAction: Pair<Int, GamrMatAction>? = null
     private var pendingCustomReset = false
     private var pendingShutdownSeconds: Int? = null
+    private var pendingInputProfile: GamrInputProfile? = null
     private var pendingDeviceName: String? = null
     private var pendingSystemAction: String? = null
     private var readRetryCount = 0
@@ -176,15 +189,18 @@ class GamrBleClient(
             val customAction = pendingCustomAction
             val customReset = pendingCustomReset
             val shutdownSeconds = pendingShutdownSeconds
+            val inputProfile = pendingInputProfile
             val deviceName = pendingDeviceName
             val systemAction = pendingSystemAction
             if (mode == null && threshold == null && customAction == null && !customReset &&
-                shutdownSeconds == null && deviceName == null && systemAction == null) return
+                shutdownSeconds == null && inputProfile == null && deviceName == null &&
+                systemAction == null) return
             pendingMode = null
             pendingThreshold = null
             pendingCustomAction = null
             pendingCustomReset = false
             pendingShutdownSeconds = null
+            pendingInputProfile = null
             pendingDeviceName = null
             pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -202,6 +218,7 @@ class GamrBleClient(
                         },
                     )
                     shutdownSeconds != null -> deviceInfo.copy(autoShutdownSeconds = shutdownSeconds)
+                    inputProfile != null -> deviceInfo.copy(inputProfile = inputProfile)
                     deviceName != null -> deviceInfo.copy(deviceName = deviceName)
                     else -> deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) {
                         GamrMatAction.DISABLED
@@ -371,6 +388,26 @@ class GamrBleClient(
     }
 
     @SuppressLint("MissingPermission")
+    fun setInputProfile(profile: GamrInputProfile) {
+        val currentGatt = gatt ?: return
+        val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
+
+        pendingInputProfile = profile
+        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        characteristic.value = byteArrayOf(
+            CONTROL_CMD_SET_INPUT_PROFILE,
+            profile.wireValue.toByte(),
+        )
+        if (!currentGatt.writeCharacteristic(characteristic)) {
+            pendingInputProfile = null
+            reportStatus("Could not change the input profile.")
+        } else {
+            reportStatus("Setting ${profile.label} profile...")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun setDeviceName(value: String) {
         val name = value.trim()
         if (!isValidDeviceName(name)) {
@@ -477,6 +514,14 @@ class GamrBleClient(
                                 legacyMinutes * 60
                             }
                         } else deviceInfo.autoShutdownSeconds,
+                        inputProfile = run {
+                            val nameLengthOffset = 4 + CUSTOM_ZONE_COUNT
+                            val nameLength = value.getOrNull(nameLengthOffset)?.toInt()?.and(0xFF) ?: 0
+                            val profileOffset = nameLengthOffset + 1 + nameLength + 2
+                            value.getOrNull(profileOffset)?.let {
+                                GamrInputProfile.fromWireValue(it.toInt() and 0xFF)
+                            } ?: deviceInfo.inputProfile
+                        },
                         deviceName = if (value.size >= 4 + CUSTOM_ZONE_COUNT + 1) {
                             val nameLength = value[4 + CUSTOM_ZONE_COUNT].toInt() and 0xFF
                             val nameStart = 5 + CUSTOM_ZONE_COUNT
@@ -611,6 +656,7 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_CUSTOM_ACTION: Byte = 0x04
         const val CONTROL_CMD_RESET_CUSTOM_ACTIONS: Byte = 0x05
         const val CONTROL_CMD_SET_SHUTDOWN_SECONDS: Byte = 0x0B
+        const val CONTROL_CMD_SET_INPUT_PROFILE: Byte = 0x0C
         const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
         const val CONTROL_CMD_RESTART: Byte = 0x08
         const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
