@@ -36,17 +36,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.gamr.app.ble.GamrBleClient
 import com.gamr.app.ble.GamrBleScanner
 import com.gamr.app.ble.GamrDevice
 import com.gamr.app.ble.GamrDeviceInfo
+import com.gamr.app.ble.GamrDeviceSource
 import com.gamr.app.ble.GamrMode
 import com.gamr.app.ble.GamrMatAction
 import com.gamr.app.ui.theme.GamrCyan
@@ -65,6 +68,7 @@ class MainActivity : ComponentActivity() {
     private var discoveredDevices by mutableStateOf(emptyList<GamrDevice>())
     private var matRows by mutableStateOf(List(5) { 0 })
     private var hasScanned by mutableStateOf(false)
+    private var activeBleSession = 0L
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -82,16 +86,26 @@ class MainActivity : ComponentActivity() {
         }
         bleClient = GamrBleClient(
             context = this,
-            onStatusChanged = { status ->
+            onStatusChanged = { session, status ->
                 runOnUiThread {
-                    connectionStatus = status
+                    if (session != activeBleSession) return@runOnUiThread
                     if (status == "Disconnected" || status.startsWith("Connection failed")) {
-                        connectedDevice = null
+                        returnToScan()
+                        return@runOnUiThread
                     }
+                    connectionStatus = status
                 }
             },
-            onDeviceInfoRead = { info -> runOnUiThread { deviceInfo = info } },
-            onMatFrameChanged = { rows -> runOnUiThread { matRows = rows } },
+            onDeviceInfoRead = { session, info ->
+                runOnUiThread {
+                    if (session == activeBleSession) deviceInfo = info
+                }
+            },
+            onMatFrameChanged = { session, rows ->
+                runOnUiThread {
+                    if (session == activeBleSession) matRows = rows
+                }
+            },
         )
 
         setContent {
@@ -139,6 +153,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun returnToScan() {
+        activeBleSession++
         connectedDevice = null
         discoveredDevices = emptyList()
         matRows = List(5) { 0 }
@@ -150,8 +165,10 @@ class MainActivity : ComponentActivity() {
     private fun connectToDevice(device: GamrDevice) {
         scanner.stop()
         connectedDevice = device
+        deviceInfo = GamrDeviceInfo()
+        matRows = List(5) { 0 }
         connectionStatus = "Connecting..."
-        bleClient.connect(device)
+        activeBleSession = bleClient.connect(device)
     }
 
     private fun disconnect() {
@@ -455,6 +472,24 @@ private fun ActionDialog(
 }
 
 @Composable
+private fun BackButton(label: String, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("←", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = label,
+                modifier = Modifier.weight(1f),
+                textAlign = TextAlign.Start,
+            )
+        }
+    }
+}
+
+@Composable
 private fun ConfigurationPanel(
     device: GamrDevice,
     info: GamrDeviceInfo,
@@ -479,7 +514,7 @@ private fun ConfigurationPanel(
 
     Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
         Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onBack) { Text("← BACK") }
+            BackButton(label = "BACK", onClick = onBack)
             Text("CONFIGURATION", style = MaterialTheme.typography.headlineSmall)
             Text("DEVICE NAME", style = MaterialTheme.typography.labelLarge)
             OutlinedTextField(
@@ -489,7 +524,7 @@ private fun ConfigurationPanel(
                 isError = nameEdited && !nameValid,
                 supportingText = { Text(if (nameEdited && !nameValid)
                     "A name is required (1–24 standard characters)."
-                else "Used for the next BLE advertisement.") },
+                else "Used by GAMR advertisements. Android may retain an old paired-device label; forget and pair again in Bluetooth Settings if it does.") },
             )
             OutlinedButton(onClick = { onDeviceNameSelected(nameDraft) },
                 enabled = nameValid && nameDraft.trim() != info.deviceName,
@@ -531,14 +566,15 @@ private fun ConfigurationPanel(
 private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List<Int>, onBack: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
         Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onBack) { Text("← CONFIGURATION") }
+            BackButton(label = "CONFIGURATION", onClick = onBack)
             Text("${mode.label} · LIVE MAT", style = MaterialTheme.typography.headlineSmall)
             Text("Press the physical MAT; active regions light up below.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             when (mode) {
                 GamrMode.GAMR -> GamrMatPreview(matRows)
-                GamrMode.BALANCE -> BalancePreview(matRows)
-                else -> ZonePreview(mode, info, matRows)
+                GamrMode.RHYTHM -> RhythmMatPreview(matRows)
+                GamrMode.BALANCE -> BalanceMatPreview(matRows)
+                GamrMode.CUSTOM -> CustomMatPreview(info, matRows)
             }
         }
     }
@@ -547,10 +583,78 @@ private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List
 @Composable
 private fun GamrMatPreview(rows: List<Int>) {
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
+    val outerZones = active.toMutableList().also { it[4] = false }
     val l3Active = (1..3).any { row -> rowPressed(rows, row, 1) }
     val r3Active = (1..3).any { row -> rowPressed(rows, row, 3) }
     val pressed = gamrActions(rows)
 
+    MatImagePreview {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            StandardMatOverlays(outerZones, List(9) { "" }, GamrPurple, maxWidth, maxHeight)
+            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight, GamrPurple, "L3")
+            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight, GamrPurple, "R3")
+        }
+    }
+    PressedActions(pressed)
+}
+
+@Composable
+private fun RhythmMatPreview(rows: List<Int>) {
+    val labels = listOf("↖", "↑", "↗", "←", "•", "→", "↙", "↓", "↘")
+    val active = (0..8).map { zone -> zonePressed(zone, rows) }
+    MatImagePreview {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            StandardMatOverlays(active, labels, Color(0xFFFF8A3D), maxWidth, maxHeight)
+        }
+    }
+    PressedActions(labels.filterIndexed { index, _ -> active[index] })
+}
+
+@Composable
+private fun CustomMatPreview(info: GamrDeviceInfo, rows: List<Int>) {
+    val labels = info.customActions.map { it.label }
+    val active = (0..8).map { zone -> zonePressed(zone, rows) }
+    MatImagePreview {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            StandardMatOverlays(active, labels, GamrCyan, maxWidth, maxHeight)
+        }
+    }
+    PressedActions(labels.filterIndexed { index, _ -> active[index] })
+}
+
+@Composable
+private fun BalanceMatPreview(rows: List<Int>) {
+    val labels = listOf("↖", "↑", "↗", "←", "•", "→", "↙", "↓", "↘")
+    val active = List(9) { index ->
+        val row = index / 3 + 1
+        val column = index % 3 + 1
+        rowPressed(rows, row, column)
+    }
+    MatImagePreview {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            repeat(3) { row ->
+                repeat(3) { column ->
+                    val index = row * 3 + column
+                    MatImageOverlayCell(
+                        active = active[index],
+                        left = 0.34f + column * 0.11f,
+                        top = 0.40f + row * 0.085f,
+                        width = 0.10f,
+                        height = 0.075f,
+                        maxWidth = maxWidth,
+                        maxHeight = maxHeight,
+                        tint = GamrGreen,
+                        label = labels[index],
+                    )
+                }
+            }
+        }
+    }
+    PressedActions(labels.filterIndexed { index, _ -> active[index] })
+}
+
+@Composable
+private fun MatImagePreview(content: @Composable BoxScope.() -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -561,28 +665,39 @@ private fun GamrMatPreview(rows: List<Int>) {
             painter = painterResource(R.drawable.gamr_mat),
             contentDescription = "GAMR mat",
             contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().alpha(0.58f),
         )
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            // These bounds follow the printed GAMR regions, not an even 3x3 grid.
-            MatImageOverlayCell(active[0], 0.08f, 0.13f, 0.21f, 0.22f, maxWidth, maxHeight)
-            MatImageOverlayCell(active[1], 0.31f, 0.13f, 0.38f, 0.22f, maxWidth, maxHeight)
-            MatImageOverlayCell(active[2], 0.71f, 0.13f, 0.21f, 0.22f, maxWidth, maxHeight)
-
-            MatImageOverlayCell(active[3], 0.08f, 0.37f, 0.21f, 0.30f, maxWidth, maxHeight)
-            MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight)
-            MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f, maxWidth, maxHeight)
-            MatImageOverlayCell(active[5], 0.71f, 0.37f, 0.21f, 0.30f, maxWidth, maxHeight)
-
-            MatImageOverlayCell(active[6], 0.08f, 0.70f, 0.21f, 0.22f, maxWidth, maxHeight)
-            MatImageOverlayCell(active[7], 0.31f, 0.70f, 0.38f, 0.22f, maxWidth, maxHeight)
-            MatImageOverlayCell(active[8], 0.71f, 0.70f, 0.21f, 0.22f, maxWidth, maxHeight)
-        }
+        content()
     }
-    Text(
-        if (pressed.isEmpty()) "No input" else pressed.joinToString(" · ") { "$it pressed" },
-        color = GamrCyan,
+}
+
+@Composable
+private fun StandardMatOverlays(
+    active: List<Boolean>,
+    labels: List<String>,
+    tint: Color,
+    maxWidth: androidx.compose.ui.unit.Dp,
+    maxHeight: androidx.compose.ui.unit.Dp,
+) {
+    val regions = listOf(
+        floatArrayOf(0.08f, 0.13f, 0.21f, 0.22f),
+        floatArrayOf(0.31f, 0.13f, 0.38f, 0.22f),
+        floatArrayOf(0.71f, 0.13f, 0.21f, 0.22f),
+        floatArrayOf(0.08f, 0.37f, 0.21f, 0.30f),
+        floatArrayOf(0.31f, 0.37f, 0.38f, 0.30f),
+        floatArrayOf(0.71f, 0.37f, 0.21f, 0.30f),
+        floatArrayOf(0.08f, 0.70f, 0.21f, 0.22f),
+        floatArrayOf(0.31f, 0.70f, 0.38f, 0.22f),
+        floatArrayOf(0.71f, 0.70f, 0.21f, 0.22f),
     )
+    regions.forEachIndexed { index, region ->
+        MatImageOverlayCell(
+            active = active.getOrElse(index) { false },
+            left = region[0], top = region[1], width = region[2], height = region[3],
+            maxWidth = maxWidth, maxHeight = maxHeight, tint = tint,
+            label = labels.getOrElse(index) { "" },
+        )
+    }
 }
 
 @Composable
@@ -594,67 +709,29 @@ private fun MatImageOverlayCell(
     height: Float,
     maxWidth: androidx.compose.ui.unit.Dp,
     maxHeight: androidx.compose.ui.unit.Dp,
+    tint: Color,
+    label: String,
 ) {
     Box(
         modifier = Modifier
             .offset(x = maxWidth * left, y = maxHeight * top)
             .size(width = maxWidth * width, height = maxHeight * height)
             .clip(RoundedCornerShape(16.dp))
-            .background(if (active) GamrPurple.copy(alpha = 0.55f) else Color.Transparent),
-    )
-}
-
-@Composable
-private fun ZonePreview(mode: GamrMode, info: GamrDeviceInfo, rows: List<Int>) {
-    val labels = when (mode) {
-        GamrMode.GAMR -> listOf("X", "↑", "A", "←", "L3 / R3", "→", "Y", "↓", "B")
-        GamrMode.RHYTHM -> listOf("↖", "↑", "↗", "←", "•", "→", "↙", "↓", "↘")
-        GamrMode.CUSTOM -> info.customActions.map { it.label }
-        GamrMode.BALANCE -> emptyList()
-    }
-    val active = (0..8).map { zone -> zonePressed(zone, rows) }
-    val activeColour = when (mode) {
-        GamrMode.GAMR -> GamrPurple
-        GamrMode.RHYTHM -> Color(0xFFFF8A3D)
-        GamrMode.CUSTOM -> GamrCyan
-        GamrMode.BALANCE -> GamrGreen
-    }
-    Box(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp))
-            .background(activeColour.copy(alpha = 0.14f)).padding(14.dp),
+            .background(if (active) tint.copy(alpha = 0.60f) else Color.Transparent),
+        contentAlignment = Alignment.Center,
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            repeat(3) { row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    repeat(3) { column ->
-                        val index = row * 3 + column
-                        Box(modifier = Modifier.weight(1f).height(72.dp).clip(RoundedCornerShape(14.dp))
-                            .background(if (active[index]) activeColour else Color.Black.copy(alpha = 0.22f)),
-                            contentAlignment = Alignment.Center) { Text(labels[index]) }
-                    }
-                }
-            }
+        if (active && label.isNotEmpty()) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White)
         }
     }
-    val pressed = if (mode == GamrMode.GAMR) gamrActions(rows) else labels.filterIndexed { index, _ -> active[index] }
-    Text(if (pressed.isEmpty()) "No input" else pressed.joinToString(" · ") { "$it pressed" },
-        color = GamrCyan)
 }
 
 @Composable
-private fun BalancePreview(rows: List<Int>) {
-    val labels = listOf("↖", "↑", "↗", "←", "•", "→", "↙", "↓", "↘")
-    repeat(3) { row ->
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            repeat(3) { column ->
-                val pressed = row < rows.size && (rows[row + 1] and (1 shl (column + 1))) != 0
-                Box(modifier = Modifier.weight(1f).height(72.dp).clip(RoundedCornerShape(14.dp))
-                    .background(if (pressed) GamrGreen else MaterialTheme.colorScheme.surfaceVariant),
-                    contentAlignment = Alignment.Center) { Text(labels[row * 3 + column]) }
-            }
-        }
-        if (row < 2) Spacer(Modifier.height(8.dp))
-    }
+private fun PressedActions(actions: List<String>) {
+    Text(
+        if (actions.isEmpty()) "No input" else actions.joinToString(" · ") { "$it pressed" },
+        color = GamrCyan,
+    )
 }
 
 private fun zonePressed(zone: Int, rows: List<Int>): Boolean {
@@ -817,7 +894,15 @@ private fun DeviceCard(device: GamrDevice, onConnectClick: () -> Unit) {
                 Text(device.name, style = MaterialTheme.typography.titleMedium)
                 Text(device.address, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("${device.rssi} dBm", style = MaterialTheme.typography.labelMedium, color = GamrCyan)
+                Text(
+                    if (device.source == GamrDeviceSource.ADVERTISING) {
+                        "${device.rssi} dBm"
+                    } else {
+                        "PAIRED ON THIS PHONE"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = GamrCyan,
+                )
             }
             Button(onClick = onConnectClick) { Text("CONNECT") }
         }

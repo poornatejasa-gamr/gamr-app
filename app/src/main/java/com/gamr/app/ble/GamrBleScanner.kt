@@ -13,8 +13,11 @@ import java.util.UUID
 data class GamrDevice(
     val name: String,
     val address: String,
-    val rssi: Int,
+    val rssi: Int? = null,
+    val source: GamrDeviceSource = GamrDeviceSource.ADVERTISING,
 )
+
+enum class GamrDeviceSource { ADVERTISING, BONDED }
 
 data class ScanStartResult(val message: String)
 
@@ -23,6 +26,8 @@ class GamrBleScanner(
     private val onDevicesChanged: (List<GamrDevice>) -> Unit,
 ) {
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
+    private val preferences = context.applicationContext
+        .getSharedPreferences("gamr_app", Context.MODE_PRIVATE)
     private val devices = linkedMapOf<String, GamrDevice>()
     private var scanning = false
 
@@ -43,7 +48,8 @@ class GamrBleScanner(
 
         stop()
         devices.clear()
-        onDevicesChanged(emptyList())
+        addBondedGamrDevices(adapter)
+        publishDevices()
 
         val otaService = ParcelUuid(UUID.fromString("0000FFF0-0000-1000-8000-00805F9B34FB"))
         val filters = listOf(ScanFilter.Builder().setServiceUuid(otaService).build())
@@ -54,7 +60,7 @@ class GamrBleScanner(
         val scanner = adapter.bluetoothLeScanner ?: return ScanStartResult("Bluetooth LE Scanner is not available.")
         scanner.startScan(filters, settings, scanCallback)
         scanning = true
-        return ScanStartResult("Scanning for nearby GAMR devices...")
+        return ScanStartResult("Scanning for nearby GAMR devices and saved paired MATs...")
     }
 
     @SuppressLint("MissingPermission")
@@ -72,10 +78,39 @@ class GamrBleScanner(
             name = advertisedName,
             address = result.device.address,
             rssi = result.rssi,
+            source = GamrDeviceSource.ADVERTISING,
         )
-        onDevicesChanged(devices.values.sortedByDescending { it.rssi })
+        preferences.edit().putStringSet(
+            KNOWN_GAMR_ADDRESSES,
+            preferences.getStringSet(KNOWN_GAMR_ADDRESSES, emptySet()).orEmpty() + result.device.address,
+        ).apply()
+        publishDevices()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun addBondedGamrDevices(adapter: android.bluetooth.BluetoothAdapter) {
+        val knownAddresses = preferences.getStringSet(KNOWN_GAMR_ADDRESSES, emptySet()).orEmpty()
+        adapter.bondedDevices.forEach { device ->
+            val name = device.name ?: "Saved GAMR"
+            if (device.address !in knownAddresses && !name.startsWith("GAMR-", ignoreCase = true)) {
+                return@forEach
+            }
+            devices[device.address] = GamrDevice(
+                name = name,
+                address = device.address,
+                source = GamrDeviceSource.BONDED,
+            )
+        }
+    }
+
+    private fun publishDevices() {
+        onDevicesChanged(devices.values.sortedWith(
+            compareByDescending<GamrDevice> { it.source == GamrDeviceSource.ADVERTISING }
+                .thenByDescending { it.rssi ?: Int.MIN_VALUE },
+        ))
     }
 
     private companion object {
+        const val KNOWN_GAMR_ADDRESSES = "known_gamr_addresses"
     }
 }

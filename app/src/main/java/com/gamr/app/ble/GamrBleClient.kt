@@ -1,6 +1,7 @@
 package com.gamr.app.ble
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothManager
@@ -52,14 +53,15 @@ enum class GamrMatAction(val wireValue: Int, val label: String) {
 
 class GamrBleClient(
     context: Context,
-    private val onStatusChanged: (String) -> Unit,
-    private val onDeviceInfoRead: (GamrDeviceInfo) -> Unit,
-    private val onMatFrameChanged: (List<Int>) -> Unit,
+    private val onStatusChanged: (Long, String) -> Unit,
+    private val onDeviceInfoRead: (Long, GamrDeviceInfo) -> Unit,
+    private val onMatFrameChanged: (Long, List<Int>) -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private var gatt: BluetoothGatt? = null
+    private var activeSession = 0L
     private var lastDevice: GamrDevice? = null
     private var reconnectAttempts = 0
     private var connectionReady = false
@@ -74,10 +76,23 @@ class GamrBleClient(
     private var pendingShutdownMinutes: Int? = null
     private var pendingDeviceName: String? = null
     private var pendingSystemAction: String? = null
+    private var readRetryCount = 0
+
+    private fun reportStatus(message: String) {
+        onStatusChanged(activeSession, message)
+    }
+
+    private fun reportDeviceInfo(info: GamrDeviceInfo) {
+        onDeviceInfoRead(activeSession, info)
+    }
+
+    private fun reportMatFrame(rows: List<Int>) {
+        onMatFrameChanged(activeSession, rows)
+    }
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (gatt != this@GamrBleClient.gatt) {
+            if (gatt !== this@GamrBleClient.gatt) {
                 gatt.close()
                 return
             }
@@ -88,10 +103,16 @@ class GamrBleClient(
             }
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                onStatusChanged("Connected. Reading GAMR details...")
-                gatt.discoverServices()
+                reportStatus("Connected. Reading GAMR details...")
+                reconnectHandler.postDelayed({
+                    if (gatt === this@GamrBleClient.gatt) {
+                        if (!gatt.discoverServices()) {
+                            retryInitialConnection("Could not start service discovery")
+                        }
+                    }
+                }, SERVICE_DISCOVERY_DELAY_MS)
             } else if (manualDisconnect || connectionReady) {
-                onStatusChanged("Disconnected")
+                reportStatus("Disconnected")
                 close()
             } else {
                 retryInitialConnection("Disconnected during setup")
@@ -99,7 +120,7 @@ class GamrBleClient(
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (gatt != this@GamrBleClient.gatt) return
+            if (gatt !== this@GamrBleClient.gatt) return
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 retryInitialConnection("Service discovery failed")
@@ -114,7 +135,12 @@ class GamrBleClient(
                 DEBUG_SERVICE_UUID to DEBUG_MAT_FRAME_UUID,
             )
             nextReadIndex = 0
-            readNextCharacteristic()
+            readRetryCount = 0
+            reconnectHandler.postDelayed({
+                if (gatt === this@GamrBleClient.gatt) {
+                    readNextCharacteristic()
+                }
+            }, SERVICE_SETTLE_DELAY_MS)
         }
 
         @Deprecated("Deprecated in Java")
@@ -123,8 +149,8 @@ class GamrBleClient(
             characteristic: android.bluetooth.BluetoothGattCharacteristic,
             status: Int,
         ) {
-            if (gatt != this@GamrBleClient.gatt) return
-            handleCharacteristicRead(characteristic.uuid, characteristic.value ?: byteArrayOf(), status)
+            if (gatt !== this@GamrBleClient.gatt) return
+            handleCharacteristicRead(gatt, characteristic.uuid, characteristic.value ?: byteArrayOf(), status)
         }
 
         override fun onCharacteristicRead(
@@ -133,8 +159,8 @@ class GamrBleClient(
             value: ByteArray,
             status: Int,
         ) {
-            if (gatt != this@GamrBleClient.gatt) return
-            handleCharacteristicRead(characteristic.uuid, value, status)
+            if (gatt !== this@GamrBleClient.gatt) return
+            handleCharacteristicRead(gatt, characteristic.uuid, value, status)
         }
 
         override fun onCharacteristicWrite(
@@ -142,7 +168,7 @@ class GamrBleClient(
             characteristic: android.bluetooth.BluetoothGattCharacteristic,
             status: Int,
         ) {
-            if (gatt != this@GamrBleClient.gatt) return
+            if (gatt !== this@GamrBleClient.gatt) return
             if (characteristic.uuid != CONTROL_CHARACTERISTIC_UUID) return
 
             val mode = pendingMode
@@ -163,7 +189,7 @@ class GamrBleClient(
             pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 if (systemAction != null) {
-                    onStatusChanged("${systemAction} requested. MAT is restarting...")
+                    reportStatus("${systemAction} requested. MAT is restarting...")
                     close()
                     return
                 }
@@ -181,10 +207,10 @@ class GamrBleClient(
                         GamrMatAction.DISABLED
                     })
                 }
-                onDeviceInfoRead(deviceInfo)
-                onStatusChanged("Connected")
+                reportDeviceInfo(deviceInfo)
+                reportStatus("Connected")
             } else {
-                onStatusChanged("Could not save configuration (GATT $status).")
+                reportStatus("Could not save configuration (GATT $status).")
             }
         }
 
@@ -193,7 +219,7 @@ class GamrBleClient(
             gatt: BluetoothGatt,
             characteristic: android.bluetooth.BluetoothGattCharacteristic,
         ) {
-            if (gatt != this@GamrBleClient.gatt) return
+            if (gatt !== this@GamrBleClient.gatt) return
             handleMatFrame(characteristic.uuid, characteristic.value ?: byteArrayOf())
         }
 
@@ -202,28 +228,31 @@ class GamrBleClient(
             characteristic: android.bluetooth.BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
-            if (gatt != this@GamrBleClient.gatt) return
+            if (gatt !== this@GamrBleClient.gatt) return
             handleMatFrame(characteristic.uuid, value)
         }
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(device: GamrDevice) {
+    fun connect(device: GamrDevice): Long {
+        activeSession++
         close()
         reconnectHandler.removeCallbacksAndMessages(null)
         lastDevice = device
         reconnectAttempts = 0
         connectionReady = false
         manualDisconnect = false
+        readRetryCount = 0
         deviceInfo = GamrDeviceInfo()
-        onDeviceInfoRead(deviceInfo)
+        reportDeviceInfo(deviceInfo)
         val adapter = bluetoothManager.adapter
         if (adapter == null) {
-            onStatusChanged("Bluetooth is not available on this phone.")
-            return
+            reportStatus("Bluetooth is not available on this phone.")
+            return activeSession
         }
 
         openGatt(device, "Connecting to ${device.name}...")
+        return activeSession
     }
 
     @SuppressLint("MissingPermission")
@@ -239,7 +268,7 @@ class GamrBleClient(
         val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID)
         if (characteristic == null) {
-            onStatusChanged("GAMR control service is unavailable.")
+            reportStatus("GAMR control service is unavailable.")
             return
         }
 
@@ -248,9 +277,9 @@ class GamrBleClient(
         characteristic.value = byteArrayOf(CONTROL_CMD_SET_MAT_MODE, mode.wireValue.toByte())
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingMode = null
-            onStatusChanged("Could not send the mode change.")
+            reportStatus("Could not send the mode change.")
         } else {
-            onStatusChanged("Setting ${mode.label} mode...")
+            reportStatus("Setting ${mode.label} mode...")
         }
     }
 
@@ -260,7 +289,7 @@ class GamrBleClient(
         val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID)
         if (characteristic == null) {
-            onStatusChanged("GAMR control service is unavailable.")
+            reportStatus("GAMR control service is unavailable.")
             return
         }
 
@@ -274,9 +303,9 @@ class GamrBleClient(
         )
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingThreshold = null
-            onStatusChanged("Could not send the sensitivity change.")
+            reportStatus("Could not send the sensitivity change.")
         } else {
-            onStatusChanged("Saving sensitivity...")
+            reportStatus("Saving sensitivity...")
         }
     }
 
@@ -296,9 +325,9 @@ class GamrBleClient(
         )
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingCustomAction = null
-            onStatusChanged("Could not save Custom mapping.")
+            reportStatus("Could not save Custom mapping.")
         } else {
-            onStatusChanged("Saving Custom mapping...")
+            reportStatus("Saving Custom mapping...")
         }
     }
 
@@ -313,9 +342,9 @@ class GamrBleClient(
         characteristic.value = byteArrayOf(CONTROL_CMD_RESET_CUSTOM_ACTIONS)
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingCustomReset = false
-            onStatusChanged("Could not reset Custom mapping.")
+            reportStatus("Could not reset Custom mapping.")
         } else {
-            onStatusChanged("Resetting Custom mapping...")
+            reportStatus("Resetting Custom mapping...")
         }
     }
 
@@ -331,9 +360,9 @@ class GamrBleClient(
         characteristic.value = byteArrayOf(CONTROL_CMD_SET_SHUTDOWN_MINUTES, minutes.toByte())
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingShutdownMinutes = null
-            onStatusChanged("Could not save auto shutdown.")
+            reportStatus("Could not save auto shutdown.")
         } else {
-            onStatusChanged("Saving auto shutdown...")
+            reportStatus("Saving auto shutdown...")
         }
     }
 
@@ -341,7 +370,7 @@ class GamrBleClient(
     fun setDeviceName(value: String) {
         val name = value.trim()
         if (!isValidDeviceName(name)) {
-            onStatusChanged("Enter a device name using 1–24 standard characters.")
+            reportStatus("Enter a device name using 1–24 standard characters.")
             return
         }
 
@@ -354,9 +383,9 @@ class GamrBleClient(
         characteristic.value = byteArrayOf(CONTROL_CMD_SET_DEVICE_NAME) + name.encodeToByteArray()
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingDeviceName = null
-            onStatusChanged("Could not save device name.")
+            reportStatus("Could not save device name.")
         } else {
-            onStatusChanged("Saving device name...")
+            reportStatus("Saving device name...")
         }
     }
 
@@ -377,9 +406,9 @@ class GamrBleClient(
         characteristic.value = byteArrayOf(command)
         if (!currentGatt.writeCharacteristic(characteristic)) {
             pendingSystemAction = null
-            onStatusChanged("Could not request $label.")
+            reportStatus("Could not request $label.")
         } else {
-            onStatusChanged("Requesting $label...")
+            reportStatus("Requesting $label...")
         }
     }
 
@@ -387,18 +416,31 @@ class GamrBleClient(
     private fun readNextCharacteristic() {
         val currentGatt = gatt ?: return
         if (nextReadIndex >= pendingReads.size) {
-            onDeviceInfoRead(deviceInfo)
+            reportDeviceInfo(deviceInfo)
             startMatFrameNotifications()
             connectionReady = true
-            onStatusChanged("Connected")
+            reportStatus("Connected")
             return
         }
 
         val (serviceUuid, characteristicUuid) = pendingReads[nextReadIndex]
         val characteristic = currentGatt.getService(serviceUuid)?.getCharacteristic(characteristicUuid)
-        if (characteristic == null || !currentGatt.readCharacteristic(characteristic)) {
+        if (characteristic == null) {
             nextReadIndex++
             readNextCharacteristic()
+            return
+        }
+
+        if (isEncryptedCharacteristic(characteristicUuid) &&
+            currentGatt.device.bondState == BluetoothDevice.BOND_NONE &&
+            currentGatt.device.createBond()) {
+            reportStatus("Pairing with GAMR…")
+            retryCurrentRead(currentGatt)
+            return
+        }
+
+        if (!currentGatt.readCharacteristic(characteristic)) {
+            retryCurrentRead(currentGatt)
         }
     }
 
@@ -434,16 +476,50 @@ class GamrBleClient(
             }
             DEBUG_MAT_FRAME_UUID -> handleMatFrame(characteristicUuid, value)
         }
-        onDeviceInfoRead(deviceInfo)
+        reportDeviceInfo(deviceInfo)
     }
 
-    private fun handleCharacteristicRead(characteristicUuid: UUID, value: ByteArray, status: Int) {
-        if (status == BluetoothGatt.GATT_SUCCESS) {
-            updateDeviceInfo(characteristicUuid, value)
+    private fun handleCharacteristicRead(
+        sourceGatt: BluetoothGatt,
+        characteristicUuid: UUID,
+        value: ByteArray,
+        status: Int,
+    ) {
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            if (isEncryptedCharacteristic(characteristicUuid)) {
+                reportStatus("Securing GAMR connection…")
+            }
+            retryCurrentRead(sourceGatt)
+            return
         }
+        readRetryCount = 0
+        updateDeviceInfo(characteristicUuid, value)
         nextReadIndex++
         readNextCharacteristic()
     }
+
+    @SuppressLint("MissingPermission")
+    private fun retryCurrentRead(sourceGatt: BluetoothGatt) {
+        if (sourceGatt !== gatt) return
+        if (readRetryCount >= MAX_READ_RETRIES) {
+            reportStatus("Connected (some data is unavailable)")
+            readRetryCount = 0
+            nextReadIndex++
+            readNextCharacteristic()
+            return
+        }
+
+        readRetryCount++
+        reconnectHandler.postDelayed({
+            if (sourceGatt === gatt) {
+                readNextCharacteristic()
+            }
+        }, READ_RETRY_DELAY_MS)
+    }
+
+    private fun isEncryptedCharacteristic(characteristicUuid: UUID): Boolean =
+        characteristicUuid == CONTROL_CHARACTERISTIC_UUID ||
+            characteristicUuid == DEBUG_MAT_FRAME_UUID
 
     @SuppressLint("MissingPermission")
     private fun startMatFrameNotifications() {
@@ -464,21 +540,21 @@ class GamrBleClient(
         if (characteristicUuid != DEBUG_MAT_FRAME_UUID || value.size < MAT_ROWS) {
             return
         }
-        onMatFrameChanged(value.take(MAT_ROWS).map { it.toInt() and 0xFF })
+        reportMatFrame(value.take(MAT_ROWS).map { it.toInt() and 0xFF })
     }
 
     @SuppressLint("MissingPermission")
     private fun retryInitialConnection(reason: String) {
         val device = lastDevice
-        if (manualDisconnect || connectionReady || device == null || reconnectAttempts >= 1) {
-            onStatusChanged("Connection failed ($reason).")
+        if (manualDisconnect || connectionReady || device == null || reconnectAttempts >= MAX_CONNECTION_RETRIES) {
+            reportStatus("Connection failed ($reason).")
             close()
             return
         }
 
         reconnectAttempts++
         close()
-        onStatusChanged("Refreshing BLE connection…")
+        reportStatus("Refreshing BLE connection…")
         reconnectHandler.postDelayed({
             if (!manualDisconnect && gatt == null) {
                 openGatt(device, "Reconnecting to ${device.name}...")
@@ -490,17 +566,20 @@ class GamrBleClient(
     private fun openGatt(device: GamrDevice, status: String) {
         val adapter = bluetoothManager.adapter
         if (adapter == null) {
-            onStatusChanged("Bluetooth is not available on this phone.")
+            reportStatus("Bluetooth is not available on this phone.")
             return
         }
-        onStatusChanged(status)
+        reportStatus(status)
         gatt = adapter.getRemoteDevice(device.address)
             .connectGatt(appContext, false, callback, android.bluetooth.BluetoothDevice.TRANSPORT_LE)
     }
 
+    @SuppressLint("MissingPermission")
     private fun close() {
-        gatt?.close()
+        val oldGatt = gatt ?: return
         gatt = null
+        oldGatt.disconnect()
+        oldGatt.close()
     }
 
     private companion object {
@@ -530,7 +609,12 @@ class GamrBleClient(
         const val MIN_SHUTDOWN_MINUTES = 5
         const val MAX_SHUTDOWN_MINUTES = 60
         const val MAX_DEVICE_NAME_LENGTH = 24
-        const val RECONNECT_DELAY_MS = 1000L
+        const val SERVICE_DISCOVERY_DELAY_MS = 600L
+        const val SERVICE_SETTLE_DELAY_MS = 250L
+        const val READ_RETRY_DELAY_MS = 600L
+        const val MAX_READ_RETRIES = 5
+        const val MAX_CONNECTION_RETRIES = 3
+        const val RECONNECT_DELAY_MS = 1200L
 
         fun isValidDeviceName(name: String): Boolean =
             name.isNotBlank() && name.length <= MAX_DEVICE_NAME_LENGTH &&
