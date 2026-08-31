@@ -223,7 +223,21 @@ private fun isMatKeyboardKey(keyCode: Int): Boolean = when (keyCode) {
     KeyEvent.KEYCODE_DPAD_RIGHT,
     KeyEvent.KEYCODE_TAB,
     KeyEvent.KEYCODE_DPAD_DOWN,
-    KeyEvent.KEYCODE_ENTER -> true
+    KeyEvent.KEYCODE_ENTER,
+    KeyEvent.KEYCODE_W,
+    KeyEvent.KEYCODE_A,
+    KeyEvent.KEYCODE_S,
+    KeyEvent.KEYCODE_D,
+    KeyEvent.KEYCODE_Q,
+    KeyEvent.KEYCODE_E,
+    KeyEvent.KEYCODE_R,
+    KeyEvent.KEYCODE_F,
+    KeyEvent.KEYCODE_1,
+    KeyEvent.KEYCODE_2,
+    KeyEvent.KEYCODE_3,
+    KeyEvent.KEYCODE_4,
+    KeyEvent.KEYCODE_SHIFT_LEFT,
+    KeyEvent.KEYCODE_CTRL_LEFT -> true
     else -> false
 }
 
@@ -625,7 +639,12 @@ private fun ConfigurationPanel(
                 }
             }
             if (selectedMode == GamrMode.CUSTOM) {
-                CustomMappingEditor(info.customActions, onCustomActionSelected, onCustomReset)
+                CustomMappingEditor(
+                    actions = info.customActions,
+                    profile = selectedProfile,
+                    onActionSelected = onCustomActionSelected,
+                    onReset = onCustomReset,
+                )
                 OutlinedButton(onClick = { onOpenModePreview(GamrMode.CUSTOM) },
                     modifier = Modifier.fillMaxWidth()) { Text("VIEW LIVE CUSTOM MAT") }
             }
@@ -661,7 +680,7 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
     val r3Active = (1..3).any { row -> rowPressed(rows, row, 3) }
     val keyboard = profile == GamrInputProfile.KEYBOARD
     val labels = if (keyboard) {
-        listOf("ESC", "UP", "BKSP", "LEFT", "", "RIGHT", "TAB", "DOWN", "ENTER")
+        listOf("ESC", "UP", "BKSP", "LEFT", "", "RIGHT", "TAB", "DOWN", "SPACE")
     } else {
         listOf("X", "UP", "A", "LEFT", "", "RIGHT", "Y", "DOWN", "B")
     }
@@ -678,7 +697,7 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
             )
             if (keyboard) {
                 MatImageOverlayCell(centerActive, 0.45f, 0.40f, 0.10f, 0.25f,
-                    maxWidth, maxHeight, GamrPurple, "SPACE")
+                    maxWidth, maxHeight, GamrPurple, "ENTER")
             } else {
                 MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
                     maxWidth, maxHeight, GamrPurple, "L3")
@@ -707,7 +726,7 @@ private fun RhythmMatPreview(rows: List<Int>) {
 
 @Composable
 private fun CustomMatPreview(info: GamrDeviceInfo, rows: List<Int>) {
-    val labels = info.customActions.map { it.label }
+    val labels = info.customActions.map { it.labelFor(info.inputProfile) }
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
     MatImagePreview {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -875,17 +894,18 @@ private fun gamrKeyboardActions(rows: List<Int>): List<String> {
         if ((1..3).any { cell(0, it) }) add("Up")
         if (cell(0, 4)) add("Backspace")
         if ((1..3).any { cell(it, 0) }) add("Left")
-        if ((1..3).any { cell(it, 2) }) add("Space")
+        if ((1..3).any { cell(it, 2) }) add("Enter")
         if ((1..3).any { cell(it, 4) }) add("Right")
         if (cell(4, 0)) add("Tab")
         if ((1..3).any { cell(4, it) }) add("Down")
-        if (cell(4, 4)) add("Enter")
+        if (cell(4, 4)) add("Space")
     }
 }
 
 @Composable
 private fun CustomMappingEditor(
     actions: List<GamrMatAction>,
+    profile: GamrInputProfile,
     onActionSelected: (Int, GamrMatAction) -> Unit,
     onReset: () -> Unit,
 ) {
@@ -895,7 +915,7 @@ private fun CustomMappingEditor(
     Column {
         Text("CUSTOM BUTTON MAP", style = MaterialTheme.typography.labelLarge, color = GamrCyan)
         Spacer(Modifier.height(4.dp))
-        Text("Tap a zone to choose its gamepad action.", style = MaterialTheme.typography.bodySmall,
+        Text("Tap a zone to choose its ${profile.label.lowercase()} action.", style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(8.dp))
         repeat(3) { row ->
@@ -921,7 +941,7 @@ private fun CustomMappingEditor(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Text(
-                                    text = action.label,
+                                    text = action.labelFor(profile),
                                     style = MaterialTheme.typography.bodySmall,
                                     textAlign = TextAlign.Center,
                                     maxLines = 1,
@@ -933,9 +953,9 @@ private fun CustomMappingEditor(
                             expanded = expandedZone == zone,
                             onDismissRequest = { expandedZone = null },
                         ) {
-                            GamrMatAction.entries.forEach { choice ->
+                            GamrMatAction.entries.filter { it.supports(profile) }.forEach { choice ->
                                 DropdownMenuItem(
-                                    text = { Text(choice.label) },
+                                    text = { Text(choice.labelFor(profile)) },
                                     onClick = {
                                         expandedZone = null
                                         onActionSelected(zone, choice)

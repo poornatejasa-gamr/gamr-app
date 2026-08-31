@@ -54,7 +54,37 @@ enum class GamrMatAction(val wireValue: Int, val label: String) {
     DOWN_LEFT(7, "Down-left"), DOWN_RIGHT(8, "Down-right"),
     A(9, "A"), B(10, "B"), X(11, "X"), Y(12, "Y"),
     L1(13, "L1"), R1(14, "R1"), L2(15, "L2"), R2(16, "R2"),
-    L3(17, "L3"), R3(18, "R3");
+    L3(17, "L3"), R3(18, "R3"),
+    CENTER(19, "Enter"),
+    KEY_W(20, "W"), KEY_A(21, "A key"), KEY_S(22, "S"), KEY_D(23, "D"),
+    KEY_Q(24, "Q"), KEY_E(25, "E"), KEY_R(26, "R key"), KEY_F(27, "F"),
+    KEY_1(28, "1"), KEY_2(29, "2"), KEY_3(30, "3"), KEY_4(31, "4"),
+    KEY_LEFT_SHIFT(32, "Left Shift"), KEY_LEFT_CONTROL(33, "Left Ctrl");
+
+    fun labelFor(profile: GamrInputProfile): String = if (profile == GamrInputProfile.GAMEPAD) {
+        label
+    } else {
+        when (this) {
+            UP -> "Up Arrow"
+            DOWN -> "Down Arrow"
+            LEFT -> "Left Arrow"
+            RIGHT -> "Right Arrow"
+            UP_LEFT -> "Up + Left"
+            UP_RIGHT -> "Up + Right"
+            DOWN_LEFT -> "Down + Left"
+            DOWN_RIGHT -> "Down + Right"
+            A -> "Backspace"
+            B -> "Space"
+            X -> "Escape"
+            Y -> "Tab"
+            else -> label
+        }
+    }
+
+    fun supports(profile: GamrInputProfile): Boolean = when (profile) {
+        GamrInputProfile.GAMEPAD -> wireValue <= R3.wireValue
+        GamrInputProfile.KEYBOARD -> this !in listOf(L1, R1, L2, R2, L3, R3)
+    }
 
     companion object {
         fun fromWireValue(value: Int): GamrMatAction = entries.firstOrNull {
