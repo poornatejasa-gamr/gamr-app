@@ -1,13 +1,17 @@
 package com.gamr.app.ble
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import java.util.UUID
 
 data class GamrDevice(
@@ -17,7 +21,7 @@ data class GamrDevice(
     val source: GamrDeviceSource = GamrDeviceSource.ADVERTISING,
 )
 
-enum class GamrDeviceSource { ADVERTISING, BONDED }
+enum class GamrDeviceSource { ADVERTISING, CONNECTED }
 
 data class ScanStartResult(val message: String)
 
@@ -25,11 +29,30 @@ class GamrBleScanner(
     context: Context,
     private val onDevicesChanged: (List<GamrDevice>) -> Unit,
 ) {
+    private val appContext = context.applicationContext
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
-    private val preferences = context.applicationContext
-        .getSharedPreferences("gamr_app", Context.MODE_PRIVATE)
-    private val devices = linkedMapOf<String, GamrDevice>()
+    private val preferences = appContext.getSharedPreferences("gamr_app", Context.MODE_PRIVATE)
+    private val refreshHandler = Handler(Looper.getMainLooper())
+    private val advertisingDevices = linkedMapOf<String, GamrDevice>()
+    private val advertisingLastSeen = mutableMapOf<String, Long>()
+    private var hidProfile: BluetoothProfile? = null
+    private var profileRequested = false
     private var scanning = false
+
+    private val profileListener = object : BluetoothProfile.ServiceListener {
+        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+            if (profile != HID_DEVICE_PROFILE) return
+            hidProfile = proxy
+            if (scanning) publishDevices()
+        }
+
+        override fun onServiceDisconnected(profile: Int) {
+            if (profile != HID_DEVICE_PROFILE) return
+            hidProfile = null
+            profileRequested = false
+            if (scanning) publishDevices()
+        }
+    }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -38,6 +61,15 @@ class GamrBleScanner(
 
         override fun onScanFailed(errorCode: Int) {
             scanning = false
+            refreshHandler.removeCallbacks(refreshConnectedDevices)
+        }
+    }
+
+    private val refreshConnectedDevices = object : Runnable {
+        override fun run() {
+            if (!scanning) return
+            publishDevices()
+            refreshHandler.postDelayed(this, CONNECTION_REFRESH_MS)
         }
     }
 
@@ -47,8 +79,11 @@ class GamrBleScanner(
         if (!adapter.isEnabled) return ScanStartResult("Turn on Bluetooth, then scan again.")
 
         stop()
-        devices.clear()
-        addBondedGamrDevices(adapter)
+        advertisingDevices.clear()
+        advertisingLastSeen.clear()
+        if (!profileRequested) {
+            profileRequested = adapter.getProfileProxy(appContext, profileListener, HID_DEVICE_PROFILE)
+        }
         publishDevices()
 
         val otaService = ParcelUuid(UUID.fromString("0000FFF0-0000-1000-8000-00805F9B34FB"))
@@ -60,26 +95,36 @@ class GamrBleScanner(
         val scanner = adapter.bluetoothLeScanner ?: return ScanStartResult("Bluetooth LE Scanner is not available.")
         scanner.startScan(filters, settings, scanCallback)
         scanning = true
-        return ScanStartResult("Scanning for nearby GAMR devices and saved paired MATs...")
+        refreshHandler.post(refreshConnectedDevices)
+        return ScanStartResult("Scanning for advertising or connected GAMR devices...")
     }
 
     @SuppressLint("MissingPermission")
     fun stop() {
+        refreshHandler.removeCallbacks(refreshConnectedDevices)
         if (!scanning) return
         bluetoothManager.adapter?.bluetoothLeScanner?.stopScan(scanCallback)
         scanning = false
+    }
+
+    fun close() {
+        stop()
+        hidProfile?.let { bluetoothManager.adapter?.closeProfileProxy(HID_DEVICE_PROFILE, it) }
+        hidProfile = null
+        profileRequested = false
     }
 
     @SuppressLint("MissingPermission")
     private fun addResult(result: ScanResult) {
         val advertisedName = result.scanRecord?.deviceName ?: result.device.name ?: "Unnamed GAMR"
 
-        devices[result.device.address] = GamrDevice(
+        advertisingDevices[result.device.address] = GamrDevice(
             name = advertisedName,
             address = result.device.address,
             rssi = result.rssi,
             source = GamrDeviceSource.ADVERTISING,
         )
+        advertisingLastSeen[result.device.address] = SystemClock.elapsedRealtime()
         preferences.edit().putStringSet(
             KNOWN_GAMR_ADDRESSES,
             preferences.getStringSet(KNOWN_GAMR_ADDRESSES, emptySet()).orEmpty() + result.device.address,
@@ -88,29 +133,48 @@ class GamrBleScanner(
     }
 
     @SuppressLint("MissingPermission")
-    private fun addBondedGamrDevices(adapter: android.bluetooth.BluetoothAdapter) {
+    private fun connectedGamrDevices(): List<GamrDevice> {
         val knownAddresses = preferences.getStringSet(KNOWN_GAMR_ADDRESSES, emptySet()).orEmpty()
-        adapter.bondedDevices.forEach { device ->
-            val name = device.name ?: "Saved GAMR"
+        val connectedDevices = (
+            hidProfile?.connectedDevices.orEmpty() +
+                bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
+            ).distinctBy { it.address }
+
+        return connectedDevices.mapNotNull { device ->
+            val name = device.name ?: "Connected GAMR"
             if (device.address !in knownAddresses && !name.startsWith("GAMR-", ignoreCase = true)) {
-                return@forEach
+                return@mapNotNull null
             }
-            devices[device.address] = GamrDevice(
+            GamrDevice(
                 name = name,
                 address = device.address,
-                source = GamrDeviceSource.BONDED,
+                source = GamrDeviceSource.CONNECTED,
             )
         }
     }
 
     private fun publishDevices() {
+        val expiryTime = SystemClock.elapsedRealtime() - ADVERTISEMENT_EXPIRY_MS
+        val expiredAddresses = advertisingLastSeen
+            .filterValues { it < expiryTime }
+            .keys
+        expiredAddresses.forEach { address ->
+            advertisingLastSeen.remove(address)
+            advertisingDevices.remove(address)
+        }
+
+        val devices = advertisingDevices.toMutableMap()
+        connectedGamrDevices().forEach { devices[it.address] = it }
         onDevicesChanged(devices.values.sortedWith(
-            compareByDescending<GamrDevice> { it.source == GamrDeviceSource.ADVERTISING }
+            compareByDescending<GamrDevice> { it.source == GamrDeviceSource.CONNECTED }
                 .thenByDescending { it.rssi ?: Int.MIN_VALUE },
         ))
     }
 
     private companion object {
+        const val HID_DEVICE_PROFILE = 4
+        const val CONNECTION_REFRESH_MS = 1000L
+        const val ADVERTISEMENT_EXPIRY_MS = 5000L
         const val KNOWN_GAMR_ADDRESSES = "known_gamr_addresses"
     }
 }

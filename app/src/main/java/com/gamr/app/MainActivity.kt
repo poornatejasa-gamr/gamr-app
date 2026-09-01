@@ -146,7 +146,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        if (::scanner.isInitialized) scanner.stop()
+        if (::scanner.isInitialized) scanner.close()
         if (::bleClient.isInitialized) bleClient.disconnect()
         super.onDestroy()
     }
@@ -1051,10 +1051,10 @@ private fun DeviceCard(device: GamrDevice, onConnectClick: () -> Unit) {
                 Text(device.address, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
-                    if (device.source == GamrDeviceSource.ADVERTISING) {
-                        "${device.rssi} dBm"
+                    if (device.source == GamrDeviceSource.CONNECTED) {
+                        "CONNECTED TO THIS PHONE"
                     } else {
-                        "PAIRED ON THIS PHONE"
+                        "${device.rssi} dBm"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = GamrCyan,
@@ -1077,7 +1077,7 @@ private fun EmptyDeviceCard() {
             Text("No GAMR found", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(4.dp))
             Text(
-                "Turn on the mat and ensure it is advertising, then scan again.",
+                "Turn on the mat and ensure it is advertising or connected to this phone, then scan again.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

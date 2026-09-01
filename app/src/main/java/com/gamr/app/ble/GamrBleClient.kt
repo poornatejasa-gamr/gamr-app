@@ -278,6 +278,25 @@ class GamrBleClient(
             if (gatt !== this@GamrBleClient.gatt) return
             handleMatFrame(characteristic.uuid, value)
         }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: android.bluetooth.BluetoothGattDescriptor,
+            status: Int,
+        ) {
+            if (gatt !== this@GamrBleClient.gatt ||
+                descriptor.uuid != CLIENT_CHARACTERISTIC_CONFIG_UUID ||
+                descriptor.characteristic.uuid != DEBUG_MAT_FRAME_UUID) {
+                return
+            }
+
+            connectionReady = true
+            reportStatus(if (status == BluetoothGatt.GATT_SUCCESS) {
+                "Connected"
+            } else {
+                "Connected (live input unavailable)"
+            })
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -488,9 +507,12 @@ class GamrBleClient(
         val currentGatt = gatt ?: return
         if (nextReadIndex >= pendingReads.size) {
             reportDeviceInfo(deviceInfo)
-            startMatFrameNotifications()
-            connectionReady = true
-            reportStatus("Connected")
+            if (startMatFrameNotifications()) {
+                reportStatus("Enabling live input…")
+            } else {
+                connectionReady = true
+                reportStatus("Connected (live input unavailable)")
+            }
             return
         }
 
@@ -610,18 +632,18 @@ class GamrBleClient(
             characteristicUuid == DEBUG_MAT_FRAME_UUID
 
     @SuppressLint("MissingPermission")
-    private fun startMatFrameNotifications() {
-        val currentGatt = gatt ?: return
+    private fun startMatFrameNotifications(): Boolean {
+        val currentGatt = gatt ?: return false
         val characteristic = currentGatt.getService(DEBUG_SERVICE_UUID)
-            ?.getCharacteristic(DEBUG_MAT_FRAME_UUID) ?: return
-        val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: return
+            ?.getCharacteristic(DEBUG_MAT_FRAME_UUID) ?: return false
+        val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: return false
 
         if (!currentGatt.setCharacteristicNotification(characteristic, true)) {
-            return
+            return false
         }
 
         descriptor.value = android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        currentGatt.writeDescriptor(descriptor)
+        return currentGatt.writeDescriptor(descriptor)
     }
 
     private fun handleMatFrame(characteristicUuid: UUID, value: ByteArray) {
