@@ -1,15 +1,27 @@
 package com.gamr.app.ble
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattConnectionSettings
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.core.content.ContextCompat
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.UUID
+import java.util.zip.CRC32
 
 data class GamrDeviceInfo(
     val deviceName: String = "-",
@@ -21,6 +33,40 @@ data class GamrDeviceInfo(
     val customActions: List<GamrMatAction> = List(9) { GamrMatAction.DISABLED },
     val autoShutdownSeconds: Int = 15 * 60,
     val inputProfile: GamrInputProfile = GamrInputProfile.GAMEPAD,
+)
+
+data class GamrOtaProgress(
+    val fileName: String = "",
+    val progress: Int = 0,
+    val message: String = "",
+    val active: Boolean = false,
+    val completed: Boolean = false,
+    val failed: Boolean = false,
+)
+
+private enum class OtaPhase {
+    PREPARING,
+    STARTING,
+    SENDING,
+    FINISHING,
+    REBOOTING,
+}
+
+private enum class OtaStartFormat {
+    SHA256,
+    CRC32_SHA256,
+    CRC32_ONLY,
+}
+
+private class OtaSession(
+    val fileName: String,
+    val image: ByteArray,
+    val sha256: ByteArray,
+    var phase: OtaPhase = OtaPhase.PREPARING,
+    var offset: Int = 0,
+    var pendingChunkSize: Int = 0,
+    var lastProgress: Int = -1,
+    var startFormat: OtaStartFormat = OtaStartFormat.SHA256,
 )
 
 enum class GamrInputProfile(val wireValue: Int, val label: String) {
@@ -98,6 +144,7 @@ class GamrBleClient(
     private val onStatusChanged: (Long, String) -> Unit,
     private val onDeviceInfoRead: (Long, GamrDeviceInfo) -> Unit,
     private val onMatFrameChanged: (Long, List<Int>) -> Unit,
+    private val onOtaProgressChanged: (Long, GamrOtaProgress) -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
@@ -120,6 +167,9 @@ class GamrBleClient(
     private var pendingDeviceName: String? = null
     private var pendingSystemAction: String? = null
     private var readRetryCount = 0
+    private var negotiatedMtu = DEFAULT_ATT_MTU
+    private var otaSession: OtaSession? = null
+    private var otaTimeoutToken = 0
 
     private fun reportStatus(message: String) {
         onStatusChanged(activeSession, message)
@@ -133,14 +183,30 @@ class GamrBleClient(
         onMatFrameChanged(activeSession, rows)
     }
 
+    private fun reportOta(progress: GamrOtaProgress) {
+        onOtaProgressChanged(activeSession, progress)
+    }
+
+    @SuppressLint("MissingPermission")
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (gatt !== this@GamrBleClient.gatt) {
-                gatt.close()
+                closeGatt(gatt, disconnect = false)
+                return
+            }
+
+            if (newState == BluetoothProfile.STATE_DISCONNECTED &&
+                otaSession?.phase == OtaPhase.REBOOTING) {
+                finishOtaSuccessfully()
+                close()
                 return
             }
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                if (otaSession != null) {
+                    failOta("Firmware update connection failed (GATT $status).")
+                    return
+                }
                 retryInitialConnection("GATT $status")
                 return
             }
@@ -149,7 +215,10 @@ class GamrBleClient(
                 reportStatus("Connected. Reading GAMR details...")
                 reconnectHandler.postDelayed({
                     if (gatt === this@GamrBleClient.gatt) {
-                        if (!gatt.discoverServices()) {
+                        if (!hasBluetoothConnectPermission()) {
+                            reportStatus("Bluetooth permission was removed.")
+                            close()
+                        } else if (!gatt.discoverServices()) {
                             retryInitialConnection("Could not start service discovery")
                         }
                     }
@@ -186,10 +255,10 @@ class GamrBleClient(
             }, SERVICE_SETTLE_DELAY_MS)
         }
 
-        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
-            characteristic: android.bluetooth.BluetoothGattCharacteristic,
+            characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
@@ -198,7 +267,7 @@ class GamrBleClient(
 
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
-            characteristic: android.bluetooth.BluetoothGattCharacteristic,
+            characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
             status: Int,
         ) {
@@ -208,10 +277,18 @@ class GamrBleClient(
 
         override fun onCharacteristicWrite(
             gatt: BluetoothGatt,
-            characteristic: android.bluetooth.BluetoothGattCharacteristic,
+            characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
+            if (characteristic.uuid == OTA_CONTROL_UUID) {
+                handleOtaControlWrite(status)
+                return
+            }
+            if (characteristic.uuid == OTA_DATA_UUID) {
+                handleOtaDataWrite(status)
+                return
+            }
             if (characteristic.uuid != CONTROL_CHARACTERISTIC_UUID) return
 
             val mode = pendingMode
@@ -235,7 +312,7 @@ class GamrBleClient(
             pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 if (systemAction != null) {
-                    reportStatus("${systemAction} requested. MAT is restarting...")
+                    reportStatus("$systemAction requested. MAT is restarting...")
                     close()
                     return
                 }
@@ -261,10 +338,20 @@ class GamrBleClient(
             }
         }
 
-        @Deprecated("Deprecated in Java")
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt !== this@GamrBleClient.gatt) return
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                negotiatedMtu = mtu
+            }
+            if (otaSession?.phase == OtaPhase.PREPARING) {
+                sendOtaStart()
+            }
+        }
+
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
-            characteristic: android.bluetooth.BluetoothGattCharacteristic,
+            characteristic: BluetoothGattCharacteristic,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
             handleMatFrame(characteristic.uuid, characteristic.value ?: byteArrayOf())
@@ -272,7 +359,7 @@ class GamrBleClient(
 
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
-            characteristic: android.bluetooth.BluetoothGattCharacteristic,
+            characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
@@ -281,7 +368,7 @@ class GamrBleClient(
 
         override fun onDescriptorWrite(
             gatt: BluetoothGatt,
-            descriptor: android.bluetooth.BluetoothGattDescriptor,
+            descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
             if (gatt !== this@GamrBleClient.gatt ||
@@ -309,8 +396,15 @@ class GamrBleClient(
         connectionReady = false
         manualDisconnect = false
         readRetryCount = 0
+        negotiatedMtu = DEFAULT_ATT_MTU
+        otaSession = null
+        cancelOtaTimeout()
         deviceInfo = GamrDeviceInfo()
         reportDeviceInfo(deviceInfo)
+        if (!hasBluetoothConnectPermission()) {
+            reportStatus("Bluetooth connection permission is required.")
+            return activeSession
+        }
         val adapter = bluetoothManager.adapter
         if (adapter == null) {
             reportStatus("Bluetooth is not available on this phone.")
@@ -323,9 +417,82 @@ class GamrBleClient(
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        if (otaSession != null) failOta("Firmware update cancelled.")
         manualDisconnect = true
         reconnectHandler.removeCallbacksAndMessages(null)
-        gatt?.disconnect()
+        val currentGatt = gatt ?: return
+        if (!hasBluetoothConnectPermission()) {
+            close()
+            return
+        }
+        try {
+            currentGatt.disconnect()
+        } catch (_: SecurityException) {
+            close()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startFirmwareUpdate(fileName: String, image: ByteArray) {
+        if (!hasBluetoothConnectPermission()) {
+            reportOta(GamrOtaProgress(
+                fileName = fileName,
+                message = "Bluetooth connection permission is required.",
+                failed = true,
+            ))
+            return
+        }
+        val currentGatt = gatt
+        if (currentGatt == null || !connectionReady) {
+            reportOta(GamrOtaProgress(
+                fileName = fileName,
+                message = "Connect to GAMR before starting the update.",
+                failed = true,
+            ))
+            return
+        }
+        if (otaSession != null) return
+        if (image.isEmpty() || image.size > MAX_OTA_IMAGE_SIZE ||
+            (image[0].toInt() and 0xFF) != ESP_IMAGE_MAGIC) {
+            reportOta(GamrOtaProgress(
+                fileName = fileName,
+                message = "Select a valid GAMR firmware .bin file (maximum 2 MiB).",
+                failed = true,
+            ))
+            return
+        }
+        if (currentGatt.getService(OTA_SERVICE_UUID) == null) {
+            reportOta(GamrOtaProgress(
+                fileName = fileName,
+                message = "This firmware does not expose the OTA service.",
+                failed = true,
+            ))
+            return
+        }
+
+        otaSession = OtaSession(
+            fileName = fileName,
+            image = image,
+            sha256 = MessageDigest.getInstance("SHA-256").digest(image),
+        )
+        reportOta(GamrOtaProgress(
+            fileName = fileName,
+            message = "Preparing secure BLE transfer…",
+            active = true,
+        ))
+
+        val mtuRequested = try {
+            currentGatt.requestMtu(OTA_REQUESTED_MTU)
+        } catch (_: SecurityException) {
+            false
+        }
+        if (!mtuRequested) {
+            sendOtaStart()
+            return
+        }
+        reconnectHandler.postDelayed({
+            if (otaSession?.phase == OtaPhase.PREPARING) sendOtaStart()
+        }, MTU_REQUEST_TIMEOUT_MS)
     }
 
     @SuppressLint("MissingPermission")
@@ -339,9 +506,12 @@ class GamrBleClient(
         }
 
         pendingMode = mode
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(CONTROL_CMD_SET_MAT_MODE, mode.wireValue.toByte())
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(CONTROL_CMD_SET_MAT_MODE, mode.wireValue.toByte()),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingMode = null
             reportStatus("Could not send the mode change.")
         } else {
@@ -361,13 +531,16 @@ class GamrBleClient(
 
         val threshold = value.coerceIn(MIN_TOUCH_THRESHOLD, MAX_TOUCH_THRESHOLD)
         pendingThreshold = threshold
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(
-            CONTROL_CMD_SET_MAT_THRESHOLD,
-            (threshold and 0xFF).toByte(),
-            ((threshold shr 8) and 0xFF).toByte(),
-        )
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(
+                    CONTROL_CMD_SET_MAT_THRESHOLD,
+                    (threshold and 0xFF).toByte(),
+                    ((threshold shr 8) and 0xFF).toByte(),
+                ),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingThreshold = null
             reportStatus("Could not send the sensitivity change.")
         } else {
@@ -383,13 +556,16 @@ class GamrBleClient(
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
         pendingCustomAction = zone to action
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(
-            CONTROL_CMD_SET_CUSTOM_ACTION,
-            zone.toByte(),
-            action.wireValue.toByte(),
-        )
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(
+                    CONTROL_CMD_SET_CUSTOM_ACTION,
+                    zone.toByte(),
+                    action.wireValue.toByte(),
+                ),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingCustomAction = null
             reportStatus("Could not save Custom mapping.")
         } else {
@@ -404,9 +580,12 @@ class GamrBleClient(
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
         pendingCustomReset = true
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(CONTROL_CMD_RESET_CUSTOM_ACTIONS)
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(CONTROL_CMD_RESET_CUSTOM_ACTIONS),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingCustomReset = false
             reportStatus("Could not reset Custom mapping.")
         } else {
@@ -422,13 +601,16 @@ class GamrBleClient(
 
         val seconds = value.coerceIn(MIN_SHUTDOWN_SECONDS, MAX_SHUTDOWN_SECONDS)
         pendingShutdownSeconds = seconds
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(
-            CONTROL_CMD_SET_SHUTDOWN_SECONDS,
-            (seconds and 0xFF).toByte(),
-            ((seconds shr 8) and 0xFF).toByte(),
-        )
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(
+                    CONTROL_CMD_SET_SHUTDOWN_SECONDS,
+                    (seconds and 0xFF).toByte(),
+                    ((seconds shr 8) and 0xFF).toByte(),
+                ),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingShutdownSeconds = null
             reportStatus("Could not save auto shutdown.")
         } else {
@@ -443,12 +625,12 @@ class GamrBleClient(
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
         pendingInputProfile = profile
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(
-            CONTROL_CMD_SET_INPUT_PROFILE,
-            profile.wireValue.toByte(),
-        )
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(CONTROL_CMD_SET_INPUT_PROFILE, profile.wireValue.toByte()),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingInputProfile = null
             reportStatus("Could not change the input profile.")
         } else {
@@ -469,9 +651,12 @@ class GamrBleClient(
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
         pendingDeviceName = name
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(CONTROL_CMD_SET_DEVICE_NAME) + name.encodeToByteArray()
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(CONTROL_CMD_SET_DEVICE_NAME) + name.encodeToByteArray(),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingDeviceName = null
             reportStatus("Could not save device name.")
         } else {
@@ -492,9 +677,12 @@ class GamrBleClient(
             ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return
 
         pendingSystemAction = label
-        characteristic.writeType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = byteArrayOf(command)
-        if (!currentGatt.writeCharacteristic(characteristic)) {
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(command),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
             pendingSystemAction = null
             reportStatus("Could not request $label.")
         } else {
@@ -503,7 +691,247 @@ class GamrBleClient(
     }
 
     @SuppressLint("MissingPermission")
+    private fun sendOtaStart(format: OtaStartFormat = OtaStartFormat.SHA256) {
+        val session = otaSession ?: return
+        if (session.phase != OtaPhase.PREPARING) return
+        val currentGatt = gatt ?: return failOta("GAMR disconnected before OTA started.")
+        val characteristic = currentGatt.getService(OTA_SERVICE_UUID)
+            ?.getCharacteristic(OTA_CONTROL_UUID)
+            ?: return failOta("OTA control characteristic is unavailable.")
+
+        val packet = when (format) {
+            OtaStartFormat.SHA256 -> ByteBuffer.allocate(OTA_START_PACKET_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .put(OTA_CMD_START)
+                .putInt(session.image.size)
+                .put(session.sha256)
+                .array()
+            OtaStartFormat.CRC32_SHA256 -> ByteBuffer.allocate(LEGACY_OTA_START_PACKET_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .put(OTA_CMD_START)
+                .putInt(session.image.size)
+                .putInt(calculateCrc32(session.image))
+                .put(session.sha256)
+                .array()
+            OtaStartFormat.CRC32_ONLY -> ByteBuffer.allocate(CRC32_OTA_START_PACKET_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .put(OTA_CMD_START)
+                .putInt(session.image.size)
+                .putInt(calculateCrc32(session.image))
+                .array()
+        }
+
+        session.startFormat = format
+        session.phase = OtaPhase.STARTING
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                packet,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
+            failOta("Could not send the OTA START packet.")
+            return
+        }
+        armOtaTimeout("The MAT did not accept the OTA START packet.")
+    }
+
+    private fun handleOtaControlWrite(status: Int) {
+        val session = otaSession ?: return
+        cancelOtaTimeout()
+
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            val nextFormat = if (session.phase == OtaPhase.STARTING &&
+                status == GATT_INVALID_ATTRIBUTE_LENGTH) {
+                when (session.startFormat) {
+                    OtaStartFormat.SHA256 -> OtaStartFormat.CRC32_SHA256
+                    OtaStartFormat.CRC32_SHA256 -> OtaStartFormat.CRC32_ONLY
+                    OtaStartFormat.CRC32_ONLY -> null
+                }
+            } else null
+            if (nextFormat != null) {
+                session.phase = OtaPhase.PREPARING
+                reportOta(GamrOtaProgress(
+                    fileName = session.fileName,
+                    message = if (nextFormat == OtaStartFormat.CRC32_ONLY) {
+                        "Migrating CRC32-only firmware…"
+                    } else {
+                        "Migrating the previous OTA protocol…"
+                    },
+                    active = true,
+                ))
+                sendOtaStart(nextFormat)
+                return
+            }
+            failOta("OTA command failed (GATT $status).")
+            return
+        }
+
+        when (session.phase) {
+            OtaPhase.STARTING -> {
+                session.phase = OtaPhase.SENDING
+                reportOta(GamrOtaProgress(
+                    fileName = session.fileName,
+                    message = "Uploading firmware…",
+                    active = true,
+                ))
+                writeNextOtaChunk()
+            }
+            OtaPhase.FINISHING -> {
+                reportOta(GamrOtaProgress(
+                    fileName = session.fileName,
+                    progress = 100,
+                    message = "Firmware verified. Restarting GAMR…",
+                    active = true,
+                ))
+                writeOtaCommand(OTA_CMD_REBOOT, OtaPhase.REBOOTING)
+            }
+            OtaPhase.REBOOTING -> {
+                reconnectHandler.postDelayed({
+                    if (otaSession?.phase == OtaPhase.REBOOTING) {
+                        finishOtaSuccessfully()
+                        close()
+                    }
+                }, OTA_REBOOT_TIMEOUT_MS)
+            }
+            else -> Unit
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeNextOtaChunk() {
+        val session = otaSession ?: return
+        if (session.phase != OtaPhase.SENDING) return
+        if (session.offset >= session.image.size) {
+            writeOtaCommand(OTA_CMD_END, OtaPhase.FINISHING)
+            return
+        }
+
+        val currentGatt = gatt ?: return failOta("GAMR disconnected during upload.")
+        val characteristic = currentGatt.getService(OTA_SERVICE_UUID)
+            ?.getCharacteristic(OTA_DATA_UUID)
+            ?: return failOta("OTA data characteristic is unavailable.")
+        val payloadSize = (negotiatedMtu - ATT_HEADER_SIZE)
+            .coerceIn(MIN_OTA_CHUNK_SIZE, MAX_OTA_CHUNK_SIZE)
+        val end = (session.offset + payloadSize).coerceAtMost(session.image.size)
+        val chunk = session.image.copyOfRange(session.offset, end)
+        session.pendingChunkSize = chunk.size
+
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                chunk,
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+            )) {
+            failOta("Android could not queue the next firmware chunk.")
+            return
+        }
+        armOtaTimeout("Firmware transfer stopped responding.")
+    }
+
+    private fun handleOtaDataWrite(status: Int) {
+        val session = otaSession ?: return
+        if (session.phase != OtaPhase.SENDING) return
+        cancelOtaTimeout()
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            failOta("Firmware data write failed (GATT $status).")
+            return
+        }
+
+        session.offset += session.pendingChunkSize
+        session.pendingChunkSize = 0
+        val progress = ((session.offset.toLong() * 100L) / session.image.size).toInt()
+        if (progress != session.lastProgress) {
+            session.lastProgress = progress
+            reportOta(GamrOtaProgress(
+                fileName = session.fileName,
+                progress = progress,
+                message = "Uploading firmware…",
+                active = true,
+            ))
+        }
+        writeNextOtaChunk()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeOtaCommand(command: Byte, phase: OtaPhase) {
+        val session = otaSession ?: return
+        val currentGatt = gatt ?: return failOta("GAMR disconnected during verification.")
+        val characteristic = currentGatt.getService(OTA_SERVICE_UUID)
+            ?.getCharacteristic(OTA_CONTROL_UUID)
+            ?: return failOta("OTA control characteristic is unavailable.")
+
+        session.phase = phase
+        if (!writeCharacteristic(
+                currentGatt,
+                characteristic,
+                byteArrayOf(command),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            )) {
+            failOta("Could not send the OTA command.")
+            return
+        }
+        armOtaTimeout("The MAT did not finish the OTA command.")
+    }
+
+    private fun armOtaTimeout(message: String) {
+        val token = ++otaTimeoutToken
+        reconnectHandler.postDelayed({
+            if (token == otaTimeoutToken && otaSession != null) failOta(message)
+        }, OTA_OPERATION_TIMEOUT_MS)
+    }
+
+    private fun cancelOtaTimeout() {
+        otaTimeoutToken++
+    }
+
+    private fun calculateCrc32(image: ByteArray): Int =
+        CRC32().apply { update(image) }.value.toInt()
+
+    private fun failOta(message: String) {
+        val session = otaSession ?: return
+        cancelOtaTimeout()
+        abortOtaOnDevice()
+        otaSession = null
+        reportOta(GamrOtaProgress(
+            fileName = session.fileName,
+            progress = session.lastProgress.coerceAtLeast(0),
+            message = message,
+            failed = true,
+        ))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun abortOtaOnDevice() {
+        val currentGatt = gatt ?: return
+        val characteristic = currentGatt.getService(OTA_SERVICE_UUID)
+            ?.getCharacteristic(OTA_CONTROL_UUID) ?: return
+        writeCharacteristic(
+            currentGatt,
+            characteristic,
+            byteArrayOf(OTA_CMD_ABORT),
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+        )
+    }
+
+    private fun finishOtaSuccessfully() {
+        val session = otaSession ?: return
+        cancelOtaTimeout()
+        otaSession = null
+        reportOta(GamrOtaProgress(
+            fileName = session.fileName,
+            progress = 100,
+            message = "Firmware installed successfully. GAMR is restarting.",
+            completed = true,
+        ))
+    }
+
+    @SuppressLint("MissingPermission")
     private fun readNextCharacteristic() {
+        if (!hasBluetoothConnectPermission()) {
+            reportStatus("Bluetooth connection permission was removed.")
+            close()
+            return
+        }
         val currentGatt = gatt ?: return
         if (nextReadIndex >= pendingReads.size) {
             reportDeviceInfo(deviceInfo)
@@ -633,6 +1061,7 @@ class GamrBleClient(
 
     @SuppressLint("MissingPermission")
     private fun startMatFrameNotifications(): Boolean {
+        if (!hasBluetoothConnectPermission()) return false
         val currentGatt = gatt ?: return false
         val characteristic = currentGatt.getService(DEBUG_SERVICE_UUID)
             ?.getCharacteristic(DEBUG_MAT_FRAME_UUID) ?: return false
@@ -642,8 +1071,11 @@ class GamrBleClient(
             return false
         }
 
-        descriptor.value = android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        return currentGatt.writeDescriptor(descriptor)
+        return writeDescriptor(
+            currentGatt,
+            descriptor,
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+        )
     }
 
     private fun handleMatFrame(characteristicUuid: UUID, value: ByteArray) {
@@ -674,22 +1106,118 @@ class GamrBleClient(
 
     @SuppressLint("MissingPermission")
     private fun openGatt(device: GamrDevice, status: String) {
+        if (!hasBluetoothConnectPermission()) {
+            reportStatus("Bluetooth connection permission is required.")
+            return
+        }
         val adapter = bluetoothManager.adapter
         if (adapter == null) {
             reportStatus("Bluetooth is not available on this phone.")
             return
         }
         reportStatus(status)
-        gatt = adapter.getRemoteDevice(device.address)
-            .connectGatt(appContext, false, callback, android.bluetooth.BluetoothDevice.TRANSPORT_LE)
+        gatt = try {
+            val remoteDevice = adapter.getRemoteDevice(device.address)
+            if (Build.VERSION.SDK_INT >= 37) {
+                val settings = BluetoothGattConnectionSettings.Builder()
+                    .setAutoConnectEnabled(false)
+                    .setAutomaticMtuEnabled(false)
+                    .setTransport(BluetoothDevice.TRANSPORT_LE)
+                    .build()
+                remoteDevice.connectGatt(settings, appContext.mainExecutor, callback)
+            } else {
+                @Suppress("DEPRECATION")
+                remoteDevice.connectGatt(
+                    appContext,
+                    false,
+                    callback,
+                    BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_1M_MASK,
+                    reconnectHandler,
+                )
+            }
+        } catch (_: SecurityException) {
+            reportStatus("Bluetooth connection permission was removed.")
+            null
+        }
     }
 
-    @SuppressLint("MissingPermission")
     private fun close() {
         val oldGatt = gatt ?: return
         gatt = null
-        oldGatt.disconnect()
-        oldGatt.close()
+        closeGatt(oldGatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeGatt(target: BluetoothGatt, disconnect: Boolean = true) {
+        if (!hasBluetoothConnectPermission()) return
+        try {
+            if (disconnect) target.disconnect()
+            target.close()
+        } catch (_: SecurityException) {
+            // Permission can be revoked while a BLE callback is in flight.
+        }
+    }
+
+    private fun hasBluetoothConnectPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            ) == PackageManager.PERMISSION_GRANTED
+
+    @SuppressLint("MissingPermission")
+    private fun writeCharacteristic(
+        target: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+        writeType: Int,
+    ): Boolean {
+        if (!hasBluetoothConnectPermission()) {
+            reportStatus("Bluetooth connection permission was removed.")
+            return false
+        }
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                target.writeCharacteristic(characteristic, value, writeType) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.writeType = writeType
+                @Suppress("DEPRECATION")
+                characteristic.value = value
+                @Suppress("DEPRECATION")
+                target.writeCharacteristic(characteristic)
+            }
+        } catch (_: SecurityException) {
+            reportStatus("Bluetooth connection permission was removed.")
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeDescriptor(
+        target: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray,
+    ): Boolean {
+        if (!hasBluetoothConnectPermission()) {
+            reportStatus("Bluetooth connection permission was removed.")
+            return false
+        }
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                target.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                descriptor.value = value
+                @Suppress("DEPRECATION")
+                target.writeDescriptor(descriptor)
+            }
+        } catch (_: SecurityException) {
+            reportStatus("Bluetooth connection permission was removed.")
+            false
+        }
     }
 
     private companion object {
@@ -700,6 +1228,9 @@ class GamrBleClient(
         val BATTERY_LEVEL_UUID: UUID = uuid16(0x2A19)
         val CONTROL_SERVICE_UUID: UUID = uuid16(0xFFF5)
         val CONTROL_CHARACTERISTIC_UUID: UUID = uuid16(0xFFF6)
+        val OTA_SERVICE_UUID: UUID = uuid16(0xFFF0)
+        val OTA_CONTROL_UUID: UUID = uuid16(0xFFF1)
+        val OTA_DATA_UUID: UUID = uuid16(0xFFF2)
         val DEBUG_SERVICE_UUID: UUID = uuid16(0xFFF7)
         val DEBUG_MAT_FRAME_UUID: UUID = uuid16(0xFFF9)
         val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID = uuid16(0x2902)
@@ -713,6 +1244,10 @@ class GamrBleClient(
         const val CONTROL_CMD_RESTART: Byte = 0x08
         const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
         const val CONTROL_CMD_FACTORY_RESET: Byte = 0x0A
+        const val OTA_CMD_START: Byte = 0x01
+        const val OTA_CMD_END: Byte = 0x02
+        const val OTA_CMD_ABORT: Byte = 0x03
+        const val OTA_CMD_REBOOT: Byte = 0x04
         const val MIN_TOUCH_THRESHOLD = 50
         const val MAX_TOUCH_THRESHOLD = 1000
         const val MAT_ROWS = 5
@@ -726,6 +1261,20 @@ class GamrBleClient(
         const val MAX_READ_RETRIES = 5
         const val MAX_CONNECTION_RETRIES = 3
         const val RECONNECT_DELAY_MS = 1200L
+        const val ESP_IMAGE_MAGIC = 0xE9
+        const val MAX_OTA_IMAGE_SIZE = 0x200000
+        const val OTA_START_PACKET_SIZE = 37
+        const val LEGACY_OTA_START_PACKET_SIZE = 41
+        const val CRC32_OTA_START_PACKET_SIZE = 9
+        const val DEFAULT_ATT_MTU = 23
+        const val ATT_HEADER_SIZE = 3
+        const val MIN_OTA_CHUNK_SIZE = 20
+        const val MAX_OTA_CHUNK_SIZE = 512
+        const val OTA_REQUESTED_MTU = 512
+        const val MTU_REQUEST_TIMEOUT_MS = 1200L
+        const val OTA_OPERATION_TIMEOUT_MS = 15_000L
+        const val OTA_REBOOT_TIMEOUT_MS = 4_000L
+        const val GATT_INVALID_ATTRIBUTE_LENGTH = 13
 
         fun isValidDeviceName(name: String): Boolean =
             name.isNotBlank() && name.length <= MAX_DEVICE_NAME_LENGTH &&

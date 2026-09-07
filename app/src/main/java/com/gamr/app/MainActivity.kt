@@ -1,9 +1,11 @@
 package com.gamr.app
 
 import android.Manifest
+import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.view.InputDevice
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
@@ -26,6 +28,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -58,6 +61,7 @@ import com.gamr.app.ble.GamrDeviceSource
 import com.gamr.app.ble.GamrInputProfile
 import com.gamr.app.ble.GamrMode
 import com.gamr.app.ble.GamrMatAction
+import com.gamr.app.ble.GamrOtaProgress
 import com.gamr.app.ui.theme.GamrCyan
 import com.gamr.app.ui.theme.GamrGreen
 import com.gamr.app.ui.theme.GamrPurple
@@ -76,12 +80,19 @@ class MainActivity : ComponentActivity() {
     private var hasScanned by mutableStateOf(false)
     private var activeBleSession = 0L
     private var consumeMatHidKeys = false
+    private var otaProgress by mutableStateOf(GamrOtaProgress())
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissions ->
         if (permissions.values.all { it }) startGamrScan()
         else scanStatus = "Bluetooth permission is required to find GAMR."
+    }
+
+    private val firmwarePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) loadFirmware(uri)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -113,6 +124,11 @@ class MainActivity : ComponentActivity() {
                     if (session == activeBleSession) matRows = rows
                 }
             },
+            onOtaProgressChanged = { session, progress ->
+                runOnUiThread {
+                    if (session == activeBleSession) otaProgress = progress
+                }
+            },
         )
 
         setContent {
@@ -139,6 +155,9 @@ class MainActivity : ComponentActivity() {
                     onRestart = bleClient::restart,
                     onEraseUserData = bleClient::eraseUserData,
                     onFactoryReset = bleClient::factoryReset,
+                    otaProgress = otaProgress,
+                    onSelectFirmware = ::selectFirmware,
+                    onDismissOta = { otaProgress = GamrOtaProgress() },
                     onPreviewVisibilityChanged = { consumeMatHidKeys = it },
                 )
             }
@@ -179,24 +198,70 @@ class MainActivity : ComponentActivity() {
         deviceInfo = GamrDeviceInfo()
         matRows = List(5) { 0 }
         connectionStatus = "Connecting..."
+        otaProgress = GamrOtaProgress()
         activeBleSession = bleClient.connect(device)
+    }
+
+    private fun selectFirmware() {
+        firmwarePickerLauncher.launch(arrayOf("application/octet-stream", "application/x-binary", "*/*"))
+    }
+
+    private fun loadFirmware(uri: Uri) {
+        val fileName = queryDisplayName(uri) ?: "firmware.bin"
+        otaProgress = GamrOtaProgress(
+            fileName = fileName,
+            message = "Reading firmware…",
+            active = true,
+        )
+        Thread {
+            try {
+                val image = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error("The selected file could not be opened.")
+                runOnUiThread { bleClient.startFirmwareUpdate(fileName, image) }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    otaProgress = GamrOtaProgress(
+                        fileName = fileName,
+                        message = error.message ?: "Could not read the selected firmware.",
+                        failed = true,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun queryDisplayName(uri: Uri): String? = contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME),
+        null,
+        null,
+        null,
+    )?.use { cursor ->
+        if (cursor.moveToFirst()) cursor.getString(0) else null
     }
 
     private fun disconnect() {
         bleClient.disconnect()
     }
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (shouldConsumeMatKey(event)) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (shouldConsumeMatKey(event)) return true
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun shouldConsumeMatKey(event: KeyEvent): Boolean {
         val gamepadSource = event.source and
             (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK or InputDevice.SOURCE_DPAD)
         val keyboardSource = event.source and InputDevice.SOURCE_KEYBOARD
         val matKeyboardKey = isMatKeyboardKey(event.keyCode)
 
-        if (consumeMatHidKeys && (gamepadSource != 0 ||
-                (keyboardSource != 0 && matKeyboardKey))) {
-            return true
-        }
-        return super.dispatchKeyEvent(event)
+        return consumeMatHidKeys && (gamepadSource != 0 ||
+            (keyboardSource != 0 && matKeyboardKey))
     }
 
     private fun hasBluetoothPermissions(): Boolean {
@@ -264,22 +329,27 @@ private fun GamrHomeScreen(
     onRestart: () -> Unit,
     onEraseUserData: () -> Unit,
     onFactoryReset: () -> Unit,
+    otaProgress: GamrOtaProgress,
+    onSelectFirmware: () -> Unit,
+    onDismissOta: () -> Unit,
     onPreviewVisibilityChanged: (Boolean) -> Unit,
 ) {
     var connectedView by remember(connectedDevice?.address) { mutableStateOf(ConnectedView.DASHBOARD) }
     var previewMode by remember(connectedDevice?.address) { mutableStateOf(deviceInfo.mode) }
 
     BackHandler(enabled = connectedDevice != null) {
-        when (connectedView) {
-            ConnectedView.MODE_PREVIEW -> {
-                connectedView = ConnectedView.CONFIGURATION
-                onPreviewVisibilityChanged(false)
-            }
-            ConnectedView.CONFIGURATION -> connectedView = ConnectedView.DASHBOARD
-            ConnectedView.DASHBOARD -> {
-                onPreviewVisibilityChanged(false)
-                onReturnToScan()
-                onDisconnectClick()
+        if (!otaProgress.active) {
+            when (connectedView) {
+                ConnectedView.MODE_PREVIEW -> {
+                    connectedView = ConnectedView.CONFIGURATION
+                    onPreviewVisibilityChanged(false)
+                }
+                ConnectedView.CONFIGURATION -> connectedView = ConnectedView.DASHBOARD
+                ConnectedView.DASHBOARD -> {
+                    onPreviewVisibilityChanged(false)
+                    onReturnToScan()
+                    onDisconnectClick()
+                }
             }
         }
     }
@@ -306,6 +376,13 @@ private fun GamrHomeScreen(
                                 onRestart = onRestart,
                                 onEraseUserData = onEraseUserData,
                                 onFactoryReset = onFactoryReset,
+                                otaProgress = otaProgress,
+                                onSelectFirmware = onSelectFirmware,
+                                onDismissOta = {
+                                    val completed = otaProgress.completed
+                                    onDismissOta()
+                                    if (completed) onReturnToScan()
+                                },
                                 onReturnToScan = onReturnToScan,
                                 onDisconnect = {
                                     onPreviewVisibilityChanged(false)
@@ -427,6 +504,9 @@ private fun ConnectedDashboard(
     onRestart: () -> Unit,
     onEraseUserData: () -> Unit,
     onFactoryReset: () -> Unit,
+    otaProgress: GamrOtaProgress,
+    onSelectFirmware: () -> Unit,
+    onDismissOta: () -> Unit,
     onReturnToScan: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -452,7 +532,9 @@ private fun ConnectedDashboard(
             Spacer(Modifier.height(4.dp))
             Button(onClick = onConfigure, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = GamrPurple)) { Text("CONFIGURATION") }
-            OutlinedButton(onClick = { confirmation = "Update" }, modifier = Modifier.fillMaxWidth(),
+            OutlinedButton(onClick = { confirmation = "Update" },
+                enabled = !otaProgress.active,
+                modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = GamrPurple,
                     contentColor = Color.Black,
@@ -491,9 +573,9 @@ private fun ConnectedDashboard(
     when (confirmation) {
         "Update" -> ActionDialog(
             title = "Firmware update",
-            message = "The OTA file-picker and upload progress screen is the next app feature. Your current firmware version is ${info.firmwareVersion}.",
-            confirmLabel = "OK",
-            onConfirm = { confirmation = null },
+            message = "Select a GAMR firmware .bin file. Keep the phone near the MAT and do not turn either device off during the update. Current version: ${info.firmwareVersion}.",
+            confirmLabel = "Choose file",
+            onConfirm = { confirmation = null; onSelectFirmware() },
             onDismiss = { confirmation = null },
         )
         "Restart" -> ActionDialog(
@@ -518,6 +600,42 @@ private fun ConnectedDashboard(
             onDismiss = { confirmation = null },
         )
     }
+
+    if (otaProgress.active || otaProgress.completed || otaProgress.failed) {
+        OtaProgressDialog(otaProgress, onDismissOta)
+    }
+}
+
+@Composable
+private fun OtaProgressDialog(progress: GamrOtaProgress, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = { if (!progress.active) onDismiss() },
+        title = {
+            Text(when {
+                progress.completed -> "Update complete"
+                progress.failed -> "Update failed"
+                else -> "Updating firmware"
+            })
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (progress.fileName.isNotBlank()) {
+                    Text(progress.fileName, style = MaterialTheme.typography.labelLarge)
+                }
+                LinearProgressIndicator(
+                    progress = { progress.progress.coerceIn(0, 100) / 100f },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text("${progress.progress.coerceIn(0, 100)}%")
+                Text(progress.message)
+            }
+        },
+        confirmButton = {
+            if (!progress.active) {
+                Button(onClick = onDismiss) { Text("Done") }
+            }
+        },
+    )
 }
 
 @Composable
