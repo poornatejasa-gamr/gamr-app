@@ -153,7 +153,7 @@ class MainActivity : ComponentActivity() {
                     onShutdownSecondsSelected = bleClient::setAutoShutdownSeconds,
                     onDeviceNameSelected = bleClient::setDeviceName,
                     onRestart = bleClient::restart,
-                    onEraseUserData = bleClient::eraseUserData,
+                    onResetUserConfiguration = bleClient::resetUserConfiguration,
                     onFactoryReset = bleClient::factoryReset,
                     otaProgress = otaProgress,
                     onSelectFirmware = ::selectFirmware,
@@ -244,14 +244,10 @@ class MainActivity : ComponentActivity() {
         bleClient.disconnect()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        /* Consume MAT HID input before Compose can activate a focused button. */
         if (shouldConsumeMatKey(event)) return true
-        return super.onKeyDown(keyCode, event)
-    }
-
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (shouldConsumeMatKey(event)) return true
-        return super.onKeyUp(keyCode, event)
+        return super.dispatchKeyEvent(event)
     }
 
     private fun shouldConsumeMatKey(event: KeyEvent): Boolean {
@@ -327,7 +323,7 @@ private fun GamrHomeScreen(
     onShutdownSecondsSelected: (Int) -> Unit,
     onDeviceNameSelected: (String) -> Unit,
     onRestart: () -> Unit,
-    onEraseUserData: () -> Unit,
+    onResetUserConfiguration: () -> Unit,
     onFactoryReset: () -> Unit,
     otaProgress: GamrOtaProgress,
     onSelectFirmware: () -> Unit,
@@ -374,7 +370,7 @@ private fun GamrHomeScreen(
                                 info = deviceInfo,
                                 onConfigure = { connectedView = ConnectedView.CONFIGURATION },
                                 onRestart = onRestart,
-                                onEraseUserData = onEraseUserData,
+                                onResetUserConfiguration = onResetUserConfiguration,
                                 onFactoryReset = onFactoryReset,
                                 otaProgress = otaProgress,
                                 onSelectFirmware = onSelectFirmware,
@@ -502,7 +498,7 @@ private fun ConnectedDashboard(
     info: GamrDeviceInfo,
     onConfigure: () -> Unit,
     onRestart: () -> Unit,
-    onEraseUserData: () -> Unit,
+    onResetUserConfiguration: () -> Unit,
     onFactoryReset: () -> Unit,
     otaProgress: GamrOtaProgress,
     onSelectFirmware: () -> Unit,
@@ -548,12 +544,12 @@ private fun ConnectedDashboard(
                 )) {
                 Text("RESTART")
             }
-            OutlinedButton(onClick = { confirmation = "Erase user data" }, modifier = Modifier.fillMaxWidth(),
+            OutlinedButton(onClick = { confirmation = "Reset User Config" }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = GamrPurple,
                     contentColor = Color.Black,
                 )) {
-                Text("ERASE USER DATA")
+                Text("RESET USER CONFIG")
             }
             OutlinedButton(onClick = { confirmation = "Factory reset" }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
@@ -585,16 +581,16 @@ private fun ConnectedDashboard(
             onConfirm = { confirmation = null; onReturnToScan(); onRestart() },
             onDismiss = { confirmation = null },
         )
-        "Erase user data" -> ActionDialog(
-            title = "Erase Bluetooth user data?",
-            message = "This removes BLE bonds and the custom device name. MAT mode and other settings stay unchanged.",
-            confirmLabel = "Erase",
-            onConfirm = { confirmation = null; onReturnToScan(); onEraseUserData() },
+        "Reset User Config" -> ActionDialog(
+            title = "Reset User Config?",
+            message = "This restores the MAT mode, sensitivity, Custom mapping, shutdown timer, input profile, and custom name. Bluetooth bonds stay paired.",
+            confirmLabel = "Reset",
+            onConfirm = { confirmation = null; onReturnToScan(); onResetUserConfiguration() },
             onDismiss = { confirmation = null },
         )
         "Factory reset" -> ActionDialog(
             title = "Factory reset MAT?",
-            message = "This clears Bluetooth bonds, the custom name, MAT mode, input profile, sensitivity, Custom mapping, and auto-shutdown setting. Firmware remains installed.",
+            message = "This clears all saved MAT data and Bluetooth bonds. Firmware remains installed. Forget GAMR in Bluetooth Settings, then pair it again.",
             confirmLabel = "Reset",
             onConfirm = { confirmation = null; onReturnToScan(); onFactoryReset() },
             onDismiss = { confirmation = null },

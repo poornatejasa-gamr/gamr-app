@@ -16,6 +16,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -155,6 +156,8 @@ class GamrBleClient(
     private var reconnectAttempts = 0
     private var connectionReady = false
     private var manualDisconnect = false
+    private var pairingInProgress = false
+    private var pairingDeadlineMs = 0L
     private var deviceInfo = GamrDeviceInfo()
     private var pendingReads = emptyList<Pair<UUID, UUID>>()
     private var nextReadIndex = 0
@@ -212,17 +215,11 @@ class GamrBleClient(
             }
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                reportStatus("Connected. Reading GAMR details...")
-                reconnectHandler.postDelayed({
-                    if (gatt === this@GamrBleClient.gatt) {
-                        if (!hasBluetoothConnectPermission()) {
-                            reportStatus("Bluetooth permission was removed.")
-                            close()
-                        } else if (!gatt.discoverServices()) {
-                            retryInitialConnection("Could not start service discovery")
-                        }
-                    }
-                }, SERVICE_DISCOVERY_DELAY_MS)
+                if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
+                    startPairing(gatt)
+                } else {
+                    beginServiceDiscovery(gatt)
+                }
             } else if (manualDisconnect || connectionReady) {
                 reportStatus("Disconnected")
                 close()
@@ -395,6 +392,8 @@ class GamrBleClient(
         reconnectAttempts = 0
         connectionReady = false
         manualDisconnect = false
+        pairingInProgress = false
+        pairingDeadlineMs = 0L
         readRetryCount = 0
         negotiatedMtu = DEFAULT_ATT_MTU
         otaSession = null
@@ -666,7 +665,8 @@ class GamrBleClient(
 
     fun restart() = sendSystemAction(CONTROL_CMD_RESTART, "Restart")
 
-    fun eraseUserData() = sendSystemAction(CONTROL_CMD_ERASE_USER_DATA, "User-data erase")
+    fun resetUserConfiguration() =
+        sendSystemAction(CONTROL_CMD_RESET_USER_CONFIGURATION, "Reset User Config")
 
     fun factoryReset() = sendSystemAction(CONTROL_CMD_FACTORY_RESET, "Factory reset")
 
@@ -953,10 +953,8 @@ class GamrBleClient(
         }
 
         if (isEncryptedCharacteristic(characteristicUuid) &&
-            currentGatt.device.bondState == BluetoothDevice.BOND_NONE &&
-            currentGatt.device.createBond()) {
-            reportStatus("Pairing with GAMR…")
-            retryCurrentRead(currentGatt)
+            currentGatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+            startPairing(currentGatt)
             return
         }
 
@@ -1060,6 +1058,54 @@ class GamrBleClient(
             characteristicUuid == DEBUG_MAT_FRAME_UUID
 
     @SuppressLint("MissingPermission")
+    private fun startPairing(target: BluetoothGatt) {
+        if (target !== gatt || pairingInProgress) return
+
+        pairingInProgress = true
+        pairingDeadlineMs = SystemClock.elapsedRealtime() + PAIRING_TIMEOUT_MS
+        reportStatus("Pairing with GAMR…")
+        if (!target.device.createBond()) {
+            pairingInProgress = false
+            reportStatus("Could not start Bluetooth pairing.")
+            close()
+            return
+        }
+        waitForBond(target)
+    }
+
+    private fun waitForBond(target: BluetoothGatt) {
+        reconnectHandler.postDelayed({
+            if (target !== gatt || !pairingInProgress) return@postDelayed
+
+            if (target.device.bondState == BluetoothDevice.BOND_BONDED) {
+                pairingInProgress = false
+                beginServiceDiscovery(target)
+            } else if (SystemClock.elapsedRealtime() >= pairingDeadlineMs) {
+                pairingInProgress = false
+                reportStatus("Pairing failed. Forget GAMR in Bluetooth Settings and try again.")
+                close()
+            } else {
+                waitForBond(target)
+            }
+        }, PAIRING_POLL_DELAY_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginServiceDiscovery(target: BluetoothGatt) {
+        if (target !== gatt) return
+        reportStatus("Connected. Reading GAMR details...")
+        reconnectHandler.postDelayed({
+            if (target !== gatt) return@postDelayed
+            if (!hasBluetoothConnectPermission()) {
+                reportStatus("Bluetooth permission was removed.")
+                close()
+            } else if (!target.discoverServices()) {
+                retryInitialConnection("Could not start service discovery")
+            }
+        }, SERVICE_DISCOVERY_DELAY_MS)
+    }
+
+    @SuppressLint("MissingPermission")
     private fun startMatFrameNotifications(): Boolean {
         if (!hasBluetoothConnectPermission()) return false
         val currentGatt = gatt ?: return false
@@ -1144,6 +1190,8 @@ class GamrBleClient(
 
     private fun close() {
         val oldGatt = gatt ?: return
+        pairingInProgress = false
+        pairingDeadlineMs = 0L
         gatt = null
         closeGatt(oldGatt)
     }
@@ -1242,7 +1290,7 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_INPUT_PROFILE: Byte = 0x0C
         const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
         const val CONTROL_CMD_RESTART: Byte = 0x08
-        const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
+        const val CONTROL_CMD_RESET_USER_CONFIGURATION: Byte = 0x09
         const val CONTROL_CMD_FACTORY_RESET: Byte = 0x0A
         const val OTA_CMD_START: Byte = 0x01
         const val OTA_CMD_END: Byte = 0x02
@@ -1261,6 +1309,8 @@ class GamrBleClient(
         const val MAX_READ_RETRIES = 5
         const val MAX_CONNECTION_RETRIES = 3
         const val RECONNECT_DELAY_MS = 1200L
+        const val PAIRING_POLL_DELAY_MS = 250L
+        const val PAIRING_TIMEOUT_MS = 15_000L
         const val ESP_IMAGE_MAGIC = 0xE9
         const val MAX_OTA_IMAGE_SIZE = 0x200000
         const val OTA_START_PACKET_SIZE = 37
