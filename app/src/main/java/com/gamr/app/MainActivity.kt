@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
@@ -251,13 +252,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shouldConsumeMatKey(event: KeyEvent): Boolean {
+        /*
+         * The live MAT view is only for observing reports.  Do not let any
+         * tested keyboard/gamepad control activate its Back button or another
+         * focused Compose control.  Keep Android's actual Back key available
+         * so a TV remote can still leave the screen deliberately.
+         */
+        return consumeMatHidKeys && event.keyCode != KeyEvent.KEYCODE_BACK
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         val gamepadSource = event.source and
             (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK or InputDevice.SOURCE_DPAD)
-        val keyboardSource = event.source and InputDevice.SOURCE_KEYBOARD
-        val matKeyboardKey = isMatKeyboardKey(event.keyCode)
-
-        return consumeMatHidKeys && (gamepadSource != 0 ||
-            (keyboardSource != 0 && matKeyboardKey))
+        if (consumeMatHidKeys && gamepadSource != 0) return true
+        return super.dispatchGenericMotionEvent(event)
     }
 
     private fun hasBluetoothPermissions(): Boolean {
@@ -273,33 +281,6 @@ class MainActivity : ComponentActivity() {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
     }
-}
-
-private fun isMatKeyboardKey(keyCode: Int): Boolean = when (keyCode) {
-    KeyEvent.KEYCODE_ESCAPE,
-    KeyEvent.KEYCODE_DPAD_UP,
-    KeyEvent.KEYCODE_DEL,
-    KeyEvent.KEYCODE_DPAD_LEFT,
-    KeyEvent.KEYCODE_SPACE,
-    KeyEvent.KEYCODE_DPAD_RIGHT,
-    KeyEvent.KEYCODE_TAB,
-    KeyEvent.KEYCODE_DPAD_DOWN,
-    KeyEvent.KEYCODE_ENTER,
-    KeyEvent.KEYCODE_W,
-    KeyEvent.KEYCODE_A,
-    KeyEvent.KEYCODE_S,
-    KeyEvent.KEYCODE_D,
-    KeyEvent.KEYCODE_Q,
-    KeyEvent.KEYCODE_E,
-    KeyEvent.KEYCODE_R,
-    KeyEvent.KEYCODE_F,
-    KeyEvent.KEYCODE_1,
-    KeyEvent.KEYCODE_2,
-    KeyEvent.KEYCODE_3,
-    KeyEvent.KEYCODE_4,
-    KeyEvent.KEYCODE_SHIFT_LEFT,
-    KeyEvent.KEYCODE_CTRL_LEFT -> true
-    else -> false
 }
 
 @Composable

@@ -218,6 +218,7 @@ class GamrBleClient(
                 if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
                     startPairing(gatt)
                 } else {
+                    requestEnabledProfileConnection(gatt.device)
                     beginServiceDiscovery(gatt)
                 }
             } else if (manualDisconnect || connectionReady) {
@@ -1079,6 +1080,7 @@ class GamrBleClient(
 
             if (target.device.bondState == BluetoothDevice.BOND_BONDED) {
                 pairingInProgress = false
+                requestEnabledProfileConnection(target.device)
                 beginServiceDiscovery(target)
             } else if (SystemClock.elapsedRealtime() >= pairingDeadlineMs) {
                 pairingInProgress = false
@@ -1103,6 +1105,23 @@ class GamrBleClient(
                 retryInitialConnection("Could not start service discovery")
             }
         }, SERVICE_DISCOVERY_DELAY_MS)
+    }
+
+    /**
+     * Ask Android to restore every user-enabled profile (including HID) for a
+     * bonded GAMR. This is separate from this companion's GATT connection.
+     * Android exposed this public API in API 37; older releases intentionally
+     * keep HID profile connection under system control, so GATT remains the
+     * supported companion connection there.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestEnabledProfileConnection(device: BluetoothDevice) {
+        if (Build.VERSION.SDK_INT < 37 || !hasBluetoothConnectPermission()) return
+        try {
+            device.connect()
+        } catch (_: SecurityException) {
+            // The GATT session can still continue if profile connection is denied.
+        }
     }
 
     @SuppressLint("MissingPermission")
