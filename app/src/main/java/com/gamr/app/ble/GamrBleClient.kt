@@ -16,6 +16,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -155,6 +156,8 @@ class GamrBleClient(
     private var reconnectAttempts = 0
     private var connectionReady = false
     private var manualDisconnect = false
+    private var pairingInProgress = false
+    private var pairingDeadlineMs = 0L
     private var deviceInfo = GamrDeviceInfo()
     private var pendingReads = emptyList<Pair<UUID, UUID>>()
     private var nextReadIndex = 0
@@ -212,17 +215,12 @@ class GamrBleClient(
             }
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                reportStatus("Connected. Reading GAMR details...")
-                reconnectHandler.postDelayed({
-                    if (gatt === this@GamrBleClient.gatt) {
-                        if (!hasBluetoothConnectPermission()) {
-                            reportStatus("Bluetooth permission was removed.")
-                            close()
-                        } else if (!gatt.discoverServices()) {
-                            retryInitialConnection("Could not start service discovery")
-                        }
-                    }
-                }, SERVICE_DISCOVERY_DELAY_MS)
+                if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
+                    startPairing(gatt)
+                } else {
+                    requestEnabledProfileConnection(gatt.device)
+                    beginServiceDiscovery(gatt)
+                }
             } else if (manualDisconnect || connectionReady) {
                 reportStatus("Disconnected")
                 close()
@@ -302,38 +300,22 @@ class GamrBleClient(
             if (mode == null && threshold == null && customAction == null && !customReset &&
                 shutdownSeconds == null && inputProfile == null && deviceName == null &&
                 systemAction == null) return
-            pendingMode = null
-            pendingThreshold = null
-            pendingCustomAction = null
-            pendingCustomReset = false
-            pendingShutdownSeconds = null
-            pendingInputProfile = null
-            pendingDeviceName = null
-            pendingSystemAction = null
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 if (systemAction != null) {
                     reportStatus("$systemAction requested. MAT is restarting...")
                     close()
                     return
                 }
-                deviceInfo = when {
-                    mode != null -> deviceInfo.copy(mode = mode)
-                    threshold != null -> deviceInfo.copy(touchThreshold = threshold)
-                    customAction != null -> deviceInfo.copy(
-                        customActions = deviceInfo.customActions.toMutableList().also {
-                            it[customAction.first] = customAction.second
-                        },
-                    )
-                    shutdownSeconds != null -> deviceInfo.copy(autoShutdownSeconds = shutdownSeconds)
-                    inputProfile != null -> deviceInfo.copy(inputProfile = inputProfile)
-                    deviceName != null -> deviceInfo.copy(deviceName = deviceName)
-                    else -> deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) {
-                        GamrMatAction.DISABLED
-                    })
-                }
-                reportDeviceInfo(deviceInfo)
-                reportStatus("Connected")
+                reportStatus("Applying configuration…")
             } else {
+                pendingMode = null
+                pendingThreshold = null
+                pendingCustomAction = null
+                pendingCustomReset = false
+                pendingShutdownSeconds = null
+                pendingInputProfile = null
+                pendingDeviceName = null
+                pendingSystemAction = null
                 reportStatus("Could not save configuration (GATT $status).")
             }
         }
@@ -354,7 +336,7 @@ class GamrBleClient(
             characteristic: BluetoothGattCharacteristic,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
-            handleMatFrame(characteristic.uuid, characteristic.value ?: byteArrayOf())
+            handleNotification(characteristic.uuid, characteristic.value ?: byteArrayOf())
         }
 
         override fun onCharacteristicChanged(
@@ -363,7 +345,7 @@ class GamrBleClient(
             value: ByteArray,
         ) {
             if (gatt !== this@GamrBleClient.gatt) return
-            handleMatFrame(characteristic.uuid, value)
+            handleNotification(characteristic.uuid, value)
         }
 
         override fun onDescriptorWrite(
@@ -372,13 +354,19 @@ class GamrBleClient(
             status: Int,
         ) {
             if (gatt !== this@GamrBleClient.gatt ||
-                descriptor.uuid != CLIENT_CHARACTERISTIC_CONFIG_UUID ||
-                descriptor.characteristic.uuid != DEBUG_MAT_FRAME_UUID) {
+                descriptor.uuid != CLIENT_CHARACTERISTIC_CONFIG_UUID) {
                 return
             }
-
+            if (descriptor.characteristic.uuid == DEBUG_MAT_FRAME_UUID &&
+                status == BluetoothGatt.GATT_SUCCESS && startControlResultNotifications()) {
+                reportStatus("Enabling configuration results…")
+                return
+            }
             connectionReady = true
-            reportStatus(if (status == BluetoothGatt.GATT_SUCCESS) {
+            reportStatus(if (descriptor.characteristic.uuid == CONTROL_CHARACTERISTIC_UUID &&
+                status != BluetoothGatt.GATT_SUCCESS) {
+                "Connected (configuration results unavailable)"
+            } else if (status == BluetoothGatt.GATT_SUCCESS) {
                 "Connected"
             } else {
                 "Connected (live input unavailable)"
@@ -395,6 +383,8 @@ class GamrBleClient(
         reconnectAttempts = 0
         connectionReady = false
         manualDisconnect = false
+        pairingInProgress = false
+        pairingDeadlineMs = 0L
         readRetryCount = 0
         negotiatedMtu = DEFAULT_ATT_MTU
         otaSession = null
@@ -666,7 +656,8 @@ class GamrBleClient(
 
     fun restart() = sendSystemAction(CONTROL_CMD_RESTART, "Restart")
 
-    fun eraseUserData() = sendSystemAction(CONTROL_CMD_ERASE_USER_DATA, "User-data erase")
+    fun resetUserConfiguration() =
+        sendSystemAction(CONTROL_CMD_RESET_USER_CONFIGURATION, "Reset User Config")
 
     fun factoryReset() = sendSystemAction(CONTROL_CMD_FACTORY_RESET, "Factory reset")
 
@@ -953,10 +944,8 @@ class GamrBleClient(
         }
 
         if (isEncryptedCharacteristic(characteristicUuid) &&
-            currentGatt.device.bondState == BluetoothDevice.BOND_NONE &&
-            currentGatt.device.createBond()) {
-            reportStatus("Pairing with GAMR…")
-            retryCurrentRead(currentGatt)
+            currentGatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+            startPairing(currentGatt)
             return
         }
 
@@ -1060,6 +1049,72 @@ class GamrBleClient(
             characteristicUuid == DEBUG_MAT_FRAME_UUID
 
     @SuppressLint("MissingPermission")
+    private fun startPairing(target: BluetoothGatt) {
+        if (target !== gatt || pairingInProgress) return
+
+        pairingInProgress = true
+        pairingDeadlineMs = SystemClock.elapsedRealtime() + PAIRING_TIMEOUT_MS
+        reportStatus("Pairing with GAMR…")
+        if (!target.device.createBond()) {
+            pairingInProgress = false
+            reportStatus("Could not start Bluetooth pairing.")
+            close()
+            return
+        }
+        waitForBond(target)
+    }
+
+    private fun waitForBond(target: BluetoothGatt) {
+        reconnectHandler.postDelayed({
+            if (target !== gatt || !pairingInProgress) return@postDelayed
+
+            if (target.device.bondState == BluetoothDevice.BOND_BONDED) {
+                pairingInProgress = false
+                requestEnabledProfileConnection(target.device)
+                beginServiceDiscovery(target)
+            } else if (SystemClock.elapsedRealtime() >= pairingDeadlineMs) {
+                pairingInProgress = false
+                reportStatus("Pairing failed. Forget GAMR in Bluetooth Settings and try again.")
+                close()
+            } else {
+                waitForBond(target)
+            }
+        }, PAIRING_POLL_DELAY_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginServiceDiscovery(target: BluetoothGatt) {
+        if (target !== gatt) return
+        reportStatus("Connected. Reading GAMR details...")
+        reconnectHandler.postDelayed({
+            if (target !== gatt) return@postDelayed
+            if (!hasBluetoothConnectPermission()) {
+                reportStatus("Bluetooth permission was removed.")
+                close()
+            } else if (!target.discoverServices()) {
+                retryInitialConnection("Could not start service discovery")
+            }
+        }, SERVICE_DISCOVERY_DELAY_MS)
+    }
+
+    /**
+     * Ask Android to restore every user-enabled profile (including HID) for a
+     * bonded GAMR. This is separate from this companion's GATT connection.
+     * Android exposed this public API in API 37; older releases intentionally
+     * keep HID profile connection under system control, so GATT remains the
+     * supported companion connection there.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestEnabledProfileConnection(device: BluetoothDevice) {
+        if (Build.VERSION.SDK_INT < 37 || !hasBluetoothConnectPermission()) return
+        try {
+            device.connect()
+        } catch (_: SecurityException) {
+            // The GATT session can still continue if profile connection is denied.
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun startMatFrameNotifications(): Boolean {
         if (!hasBluetoothConnectPermission()) return false
         val currentGatt = gatt ?: return false
@@ -1076,6 +1131,92 @@ class GamrBleClient(
             descriptor,
             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
         )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startControlResultNotifications(): Boolean {
+        if (!hasBluetoothConnectPermission()) return false
+        val currentGatt = gatt ?: return false
+        val characteristic = currentGatt.getService(CONTROL_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHARACTERISTIC_UUID) ?: return false
+        val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: return false
+        if (!currentGatt.setCharacteristicNotification(characteristic, true)) return false
+        return writeDescriptor(
+            currentGatt,
+            descriptor,
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+        )
+    }
+
+    private fun handleNotification(characteristicUuid: UUID, value: ByteArray) {
+        if (characteristicUuid == CONTROL_CHARACTERISTIC_UUID) {
+            handleControlResult(value)
+        } else {
+            handleMatFrame(characteristicUuid, value)
+        }
+    }
+
+    private fun handleControlResult(value: ByteArray) {
+        if (value.size < 3 || value[0] != CONTROL_RESULT_MARKER) return
+        val command = value[1].toInt() and 0xFF
+        val result = value[2].toInt() and 0xFF
+        val data = value.copyOfRange(3, value.size)
+        deviceInfo = when (command) {
+            CONTROL_CMD_SET_MAT_MODE.toInt() -> if (data.isNotEmpty()) {
+                deviceInfo.copy(mode = GamrMode.fromWireValue(data[0].toInt() and 0xFF))
+            } else deviceInfo
+            CONTROL_CMD_SET_MAT_THRESHOLD.toInt() -> if (data.size >= 2) {
+                deviceInfo.copy(touchThreshold = (data[0].toInt() and 0xFF) or
+                    ((data[1].toInt() and 0xFF) shl 8))
+            } else deviceInfo
+            CONTROL_CMD_SET_CUSTOM_ACTION.toInt() -> if (data.size >= 2 &&
+                data[0].toInt() in 0 until CUSTOM_ZONE_COUNT) {
+                deviceInfo.copy(customActions = deviceInfo.customActions.toMutableList().also {
+                    it[data[0].toInt()] = GamrMatAction.fromWireValue(data[1].toInt() and 0xFF)
+                })
+            } else deviceInfo
+            CONTROL_CMD_RESET_CUSTOM_ACTIONS.toInt() ->
+                deviceInfo.copy(customActions = List(CUSTOM_ZONE_COUNT) { GamrMatAction.DISABLED })
+            CONTROL_CMD_SET_SHUTDOWN_SECONDS.toInt() -> if (data.size >= 2) {
+                deviceInfo.copy(autoShutdownSeconds = (data[0].toInt() and 0xFF) or
+                    ((data[1].toInt() and 0xFF) shl 8))
+            } else deviceInfo
+            CONTROL_CMD_SET_INPUT_PROFILE.toInt() -> if (data.isNotEmpty()) {
+                deviceInfo.copy(inputProfile = GamrInputProfile.fromWireValue(data[0].toInt() and 0xFF))
+            } else deviceInfo
+            CONTROL_CMD_SET_DEVICE_NAME.toInt() -> if (data.isNotEmpty()) {
+                val length = data[0].toInt() and 0xFF
+                if (length <= data.size - 1) deviceInfo.copy(
+                    deviceName = data.copyOfRange(1, 1 + length).decodeToString(),
+                ) else deviceInfo
+            } else deviceInfo
+            else -> deviceInfo
+        }
+        reportDeviceInfo(deviceInfo)
+        pendingMode = null
+        pendingThreshold = null
+        pendingCustomAction = null
+        pendingCustomReset = false
+        pendingShutdownSeconds = null
+        pendingInputProfile = null
+        pendingDeviceName = null
+        val appliedValue = when (command) {
+            CONTROL_CMD_SET_MAT_MODE.toInt() -> "${deviceInfo.mode.label} mode"
+            CONTROL_CMD_SET_MAT_THRESHOLD.toInt() -> "sensitivity ${deviceInfo.touchThreshold}"
+            CONTROL_CMD_SET_CUSTOM_ACTION.toInt() -> "Custom mapping"
+            CONTROL_CMD_RESET_CUSTOM_ACTIONS.toInt() -> "Custom mapping reset"
+            CONTROL_CMD_SET_SHUTDOWN_SECONDS.toInt() ->
+                "auto shutdown ${deviceInfo.autoShutdownSeconds}s"
+            CONTROL_CMD_SET_INPUT_PROFILE.toInt() -> "${deviceInfo.inputProfile.label} profile"
+            CONTROL_CMD_SET_DEVICE_NAME.toInt() -> "device name ${deviceInfo.deviceName}"
+            else -> "configuration"
+        }
+        reportStatus(when (result) {
+            CONTROL_RESULT_SUCCESS -> "Saved $appliedValue"
+            CONTROL_RESULT_APPLIED_NOT_SAVED -> "Applied $appliedValue, but could not save it"
+            CONTROL_RESULT_REJECTED -> "Change rejected — release MAT inputs and try again"
+            else -> "Configuration result unavailable"
+        })
     }
 
     private fun handleMatFrame(characteristicUuid: UUID, value: ByteArray) {
@@ -1144,6 +1285,8 @@ class GamrBleClient(
 
     private fun close() {
         val oldGatt = gatt ?: return
+        pairingInProgress = false
+        pairingDeadlineMs = 0L
         gatt = null
         closeGatt(oldGatt)
     }
@@ -1242,8 +1385,12 @@ class GamrBleClient(
         const val CONTROL_CMD_SET_INPUT_PROFILE: Byte = 0x0C
         const val CONTROL_CMD_SET_DEVICE_NAME: Byte = 0x07
         const val CONTROL_CMD_RESTART: Byte = 0x08
-        const val CONTROL_CMD_ERASE_USER_DATA: Byte = 0x09
+        const val CONTROL_CMD_RESET_USER_CONFIGURATION: Byte = 0x09
         const val CONTROL_CMD_FACTORY_RESET: Byte = 0x0A
+        const val CONTROL_RESULT_MARKER: Byte = 0x80.toByte()
+        const val CONTROL_RESULT_SUCCESS = 0
+        const val CONTROL_RESULT_APPLIED_NOT_SAVED = 1
+        const val CONTROL_RESULT_REJECTED = 2
         const val OTA_CMD_START: Byte = 0x01
         const val OTA_CMD_END: Byte = 0x02
         const val OTA_CMD_ABORT: Byte = 0x03
@@ -1261,6 +1408,8 @@ class GamrBleClient(
         const val MAX_READ_RETRIES = 5
         const val MAX_CONNECTION_RETRIES = 3
         const val RECONNECT_DELAY_MS = 1200L
+        const val PAIRING_POLL_DELAY_MS = 250L
+        const val PAIRING_TIMEOUT_MS = 15_000L
         const val ESP_IMAGE_MAGIC = 0xE9
         const val MAX_OTA_IMAGE_SIZE = 0x200000
         const val OTA_START_PACKET_SIZE = 37

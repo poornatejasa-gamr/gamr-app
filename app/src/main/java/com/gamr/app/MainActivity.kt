@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
@@ -153,7 +154,7 @@ class MainActivity : ComponentActivity() {
                     onShutdownSecondsSelected = bleClient::setAutoShutdownSeconds,
                     onDeviceNameSelected = bleClient::setDeviceName,
                     onRestart = bleClient::restart,
-                    onEraseUserData = bleClient::eraseUserData,
+                    onResetUserConfiguration = bleClient::resetUserConfiguration,
                     onFactoryReset = bleClient::factoryReset,
                     otaProgress = otaProgress,
                     onSelectFirmware = ::selectFirmware,
@@ -244,24 +245,27 @@ class MainActivity : ComponentActivity() {
         bleClient.disconnect()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        /* Consume MAT HID input before Compose can activate a focused button. */
         if (shouldConsumeMatKey(event)) return true
-        return super.onKeyDown(keyCode, event)
-    }
-
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (shouldConsumeMatKey(event)) return true
-        return super.onKeyUp(keyCode, event)
+        return super.dispatchKeyEvent(event)
     }
 
     private fun shouldConsumeMatKey(event: KeyEvent): Boolean {
+        /*
+         * The live MAT view is only for observing reports.  Do not let any
+         * tested keyboard/gamepad control activate its Back button or another
+         * focused Compose control.  Keep Android's actual Back key available
+         * so a TV remote can still leave the screen deliberately.
+         */
+        return consumeMatHidKeys && event.keyCode != KeyEvent.KEYCODE_BACK
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         val gamepadSource = event.source and
             (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK or InputDevice.SOURCE_DPAD)
-        val keyboardSource = event.source and InputDevice.SOURCE_KEYBOARD
-        val matKeyboardKey = isMatKeyboardKey(event.keyCode)
-
-        return consumeMatHidKeys && (gamepadSource != 0 ||
-            (keyboardSource != 0 && matKeyboardKey))
+        if (consumeMatHidKeys && gamepadSource != 0) return true
+        return super.dispatchGenericMotionEvent(event)
     }
 
     private fun hasBluetoothPermissions(): Boolean {
@@ -277,33 +281,6 @@ class MainActivity : ComponentActivity() {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
     }
-}
-
-private fun isMatKeyboardKey(keyCode: Int): Boolean = when (keyCode) {
-    KeyEvent.KEYCODE_ESCAPE,
-    KeyEvent.KEYCODE_DPAD_UP,
-    KeyEvent.KEYCODE_DEL,
-    KeyEvent.KEYCODE_DPAD_LEFT,
-    KeyEvent.KEYCODE_SPACE,
-    KeyEvent.KEYCODE_DPAD_RIGHT,
-    KeyEvent.KEYCODE_TAB,
-    KeyEvent.KEYCODE_DPAD_DOWN,
-    KeyEvent.KEYCODE_ENTER,
-    KeyEvent.KEYCODE_W,
-    KeyEvent.KEYCODE_A,
-    KeyEvent.KEYCODE_S,
-    KeyEvent.KEYCODE_D,
-    KeyEvent.KEYCODE_Q,
-    KeyEvent.KEYCODE_E,
-    KeyEvent.KEYCODE_R,
-    KeyEvent.KEYCODE_F,
-    KeyEvent.KEYCODE_1,
-    KeyEvent.KEYCODE_2,
-    KeyEvent.KEYCODE_3,
-    KeyEvent.KEYCODE_4,
-    KeyEvent.KEYCODE_SHIFT_LEFT,
-    KeyEvent.KEYCODE_CTRL_LEFT -> true
-    else -> false
 }
 
 @Composable
@@ -327,7 +304,7 @@ private fun GamrHomeScreen(
     onShutdownSecondsSelected: (Int) -> Unit,
     onDeviceNameSelected: (String) -> Unit,
     onRestart: () -> Unit,
-    onEraseUserData: () -> Unit,
+    onResetUserConfiguration: () -> Unit,
     onFactoryReset: () -> Unit,
     otaProgress: GamrOtaProgress,
     onSelectFirmware: () -> Unit,
@@ -374,7 +351,7 @@ private fun GamrHomeScreen(
                                 info = deviceInfo,
                                 onConfigure = { connectedView = ConnectedView.CONFIGURATION },
                                 onRestart = onRestart,
-                                onEraseUserData = onEraseUserData,
+                                onResetUserConfiguration = onResetUserConfiguration,
                                 onFactoryReset = onFactoryReset,
                                 otaProgress = otaProgress,
                                 onSelectFirmware = onSelectFirmware,
@@ -395,6 +372,7 @@ private fun GamrHomeScreen(
                     ConnectedView.CONFIGURATION -> item {
                         ConfigurationPanel(
                             device = connectedDevice,
+                            status = connectionStatus,
                             info = deviceInfo,
                             onBack = { connectedView = ConnectedView.DASHBOARD },
                             onModeSelected = { mode ->
@@ -502,7 +480,7 @@ private fun ConnectedDashboard(
     info: GamrDeviceInfo,
     onConfigure: () -> Unit,
     onRestart: () -> Unit,
-    onEraseUserData: () -> Unit,
+    onResetUserConfiguration: () -> Unit,
     onFactoryReset: () -> Unit,
     otaProgress: GamrOtaProgress,
     onSelectFirmware: () -> Unit,
@@ -528,7 +506,11 @@ private fun ConnectedDashboard(
             DeviceStat("FIRMWARE", info.firmwareVersion, Modifier.fillMaxWidth())
             DeviceStat("MODE", info.mode.label, Modifier.fillMaxWidth())
             DeviceStat("INPUT PROFILE", info.inputProfile.label, Modifier.fillMaxWidth())
-            DeviceStat("SENSITIVITY", info.touchThreshold?.toString() ?: "-", Modifier.fillMaxWidth())
+            DeviceStat(
+                "SENSITIVITY",
+                info.touchThreshold?.let(::touchSensitivityFromThreshold)?.toString() ?: "-",
+                Modifier.fillMaxWidth(),
+            )
             Spacer(Modifier.height(4.dp))
             Button(onClick = onConfigure, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = GamrPurple)) { Text("CONFIGURATION") }
@@ -548,12 +530,12 @@ private fun ConnectedDashboard(
                 )) {
                 Text("RESTART")
             }
-            OutlinedButton(onClick = { confirmation = "Erase user data" }, modifier = Modifier.fillMaxWidth(),
+            OutlinedButton(onClick = { confirmation = "Reset User Config" }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = GamrPurple,
                     contentColor = Color.Black,
                 )) {
-                Text("ERASE USER DATA")
+                Text("RESET USER CONFIG")
             }
             OutlinedButton(onClick = { confirmation = "Factory reset" }, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
@@ -585,16 +567,16 @@ private fun ConnectedDashboard(
             onConfirm = { confirmation = null; onReturnToScan(); onRestart() },
             onDismiss = { confirmation = null },
         )
-        "Erase user data" -> ActionDialog(
-            title = "Erase Bluetooth user data?",
-            message = "This removes BLE bonds and the custom device name. MAT mode and other settings stay unchanged.",
-            confirmLabel = "Erase",
-            onConfirm = { confirmation = null; onReturnToScan(); onEraseUserData() },
+        "Reset User Config" -> ActionDialog(
+            title = "Reset User Config?",
+            message = "This restores the MAT mode, sensitivity, Custom mapping, shutdown timer, input profile, and custom name. Bluetooth bonds stay paired.",
+            confirmLabel = "Reset",
+            onConfirm = { confirmation = null; onReturnToScan(); onResetUserConfiguration() },
             onDismiss = { confirmation = null },
         )
         "Factory reset" -> ActionDialog(
             title = "Factory reset MAT?",
-            message = "This clears Bluetooth bonds, the custom name, MAT mode, input profile, sensitivity, Custom mapping, and auto-shutdown setting. Firmware remains installed.",
+            message = "This clears all saved MAT data and Bluetooth bonds. Firmware remains installed. Forget GAMR in Bluetooth Settings, then pair it again.",
             confirmLabel = "Reset",
             onConfirm = { confirmation = null; onReturnToScan(); onFactoryReset() },
             onDismiss = { confirmation = null },
@@ -676,6 +658,7 @@ private fun BackButton(label: String, onClick: () -> Unit) {
 @Composable
 private fun ConfigurationPanel(
     device: GamrDevice,
+    status: String,
     info: GamrDeviceInfo,
     onBack: () -> Unit,
     onModeSelected: (GamrMode) -> Unit,
@@ -688,7 +671,9 @@ private fun ConfigurationPanel(
     onCustomReset: () -> Unit,
 ) {
     var sensitivity by remember(info.touchThreshold) {
-        mutableFloatStateOf((info.touchThreshold ?: 500).coerceIn(50, 1000).toFloat())
+        mutableFloatStateOf(
+            touchSensitivityFromThreshold(info.touchThreshold ?: 500).toFloat(),
+        )
     }
     var timeout by remember(info.autoShutdownSeconds) { mutableFloatStateOf(info.autoShutdownSeconds.toFloat()) }
     var nameDraft by remember(info.deviceName, device.name) {
@@ -703,6 +688,8 @@ private fun ConfigurationPanel(
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             BackButton(label = "BACK TO DASHBOARD", onClick = onBack)
             Text("CONFIGURATION", style = MaterialTheme.typography.headlineSmall)
+            Text(status, style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("DEVICE NAME", style = MaterialTheme.typography.labelLarge)
             OutlinedTextField(
                 value = nameDraft,
@@ -717,8 +704,14 @@ private fun ConfigurationPanel(
                 enabled = nameValid && nameDraft.trim() != info.deviceName,
                 modifier = Modifier.fillMaxWidth()) { Text("SAVE DEVICE NAME") }
             Text("TOUCH SENSITIVITY · ${sensitivity.toInt()}", style = MaterialTheme.typography.labelLarge)
-            Slider(value = sensitivity, onValueChange = { sensitivity = it },
-                onValueChangeFinished = { onSensitivitySelected(sensitivity.toInt()) }, valueRange = 50f..1000f)
+            Slider(
+                value = sensitivity,
+                onValueChange = { sensitivity = it },
+                onValueChangeFinished = {
+                    onSensitivitySelected(touchThresholdFromSensitivity(sensitivity.toInt()))
+                },
+                valueRange = 100f..1000f,
+            )
             Text("AUTO SHUTDOWN · ${formatShutdownTimeout(timeout.toInt())}", style = MaterialTheme.typography.labelLarge)
             Slider(value = timeout, onValueChange = { timeout = it },
                 onValueChangeFinished = { onShutdownSecondsSelected(timeout.toInt()) },
@@ -773,6 +766,13 @@ private fun formatShutdownTimeout(seconds: Int): String {
     return if (seconds < 60) "$seconds SEC" else "${seconds / 60} MIN"
 }
 
+/* Higher app-facing sensitivity means a lower MAT press threshold. */
+private fun touchSensitivityFromThreshold(threshold: Int): Int =
+    (1000 - threshold.coerceIn(50, 1000)).coerceIn(100, 1000)
+
+private fun touchThresholdFromSensitivity(sensitivity: Int): Int =
+    (1000 - sensitivity.coerceIn(100, 1000)).coerceIn(50, 1000)
+
 @Composable
 private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List<Int>, onBack: () -> Unit) {
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -794,8 +794,6 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
     val outerZones = active.toMutableList().also { it[4] = false }
     val centerActive = (1..3).any { row -> rowPressed(rows, row, 2) }
-    val l3Active = (1..3).any { row -> rowPressed(rows, row, 1) }
-    val r3Active = (1..3).any { row -> rowPressed(rows, row, 3) }
     val keyboard = profile == GamrInputProfile.KEYBOARD
     val labels = if (keyboard) {
         listOf("ESC", "UP", "BKSP", "LEFT", "", "RIGHT", "TAB", "DOWN", "SPACE")
@@ -816,11 +814,6 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
             if (keyboard) {
                 MatImageOverlayCell(centerActive, 0.45f, 0.40f, 0.10f, 0.25f,
                     maxWidth, maxHeight, GamrPurple, "ENTER")
-            } else {
-                MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
-                    maxWidth, maxHeight, GamrPurple, "L3")
-                MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f,
-                    maxWidth, maxHeight, GamrPurple, "R3")
             }
         }
     }
@@ -996,8 +989,6 @@ private fun gamrActions(rows: List<Int>): List<String> {
         if ((1..3).any { cell(0, it) }) add("Up")
         if (cell(0, 4)) add("A")
         if ((1..3).any { cell(it, 0) }) add("Left")
-        if ((1..3).any { cell(it, 1) }) add("L3")
-        if ((1..3).any { cell(it, 3) }) add("R3")
         if ((1..3).any { cell(it, 4) }) add("Right")
         if (cell(4, 0)) add("Y")
         if ((1..3).any { cell(4, it) }) add("Down")
