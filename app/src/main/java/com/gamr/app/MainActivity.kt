@@ -524,7 +524,11 @@ private fun ConnectedDashboard(
             DeviceStat("FIRMWARE", info.firmwareVersion, Modifier.fillMaxWidth())
             DeviceStat("MODE", info.mode.label, Modifier.fillMaxWidth())
             DeviceStat("INPUT PROFILE", info.inputProfile.label, Modifier.fillMaxWidth())
-            DeviceStat("SENSITIVITY", info.touchThreshold?.toString() ?: "-", Modifier.fillMaxWidth())
+            DeviceStat(
+                "SENSITIVITY",
+                info.touchThreshold?.let(::touchSensitivityFromThreshold)?.toString() ?: "-",
+                Modifier.fillMaxWidth(),
+            )
             Spacer(Modifier.height(4.dp))
             Button(onClick = onConfigure, modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = GamrPurple)) { Text("CONFIGURATION") }
@@ -684,7 +688,9 @@ private fun ConfigurationPanel(
     onCustomReset: () -> Unit,
 ) {
     var sensitivity by remember(info.touchThreshold) {
-        mutableFloatStateOf((info.touchThreshold ?: 500).coerceIn(50, 1000).toFloat())
+        mutableFloatStateOf(
+            touchSensitivityFromThreshold(info.touchThreshold ?: 500).toFloat(),
+        )
     }
     var timeout by remember(info.autoShutdownSeconds) { mutableFloatStateOf(info.autoShutdownSeconds.toFloat()) }
     var nameDraft by remember(info.deviceName, device.name) {
@@ -713,8 +719,14 @@ private fun ConfigurationPanel(
                 enabled = nameValid && nameDraft.trim() != info.deviceName,
                 modifier = Modifier.fillMaxWidth()) { Text("SAVE DEVICE NAME") }
             Text("TOUCH SENSITIVITY · ${sensitivity.toInt()}", style = MaterialTheme.typography.labelLarge)
-            Slider(value = sensitivity, onValueChange = { sensitivity = it },
-                onValueChangeFinished = { onSensitivitySelected(sensitivity.toInt()) }, valueRange = 50f..1000f)
+            Slider(
+                value = sensitivity,
+                onValueChange = { sensitivity = it },
+                onValueChangeFinished = {
+                    onSensitivitySelected(touchThresholdFromSensitivity(sensitivity.toInt()))
+                },
+                valueRange = 100f..1000f,
+            )
             Text("AUTO SHUTDOWN · ${formatShutdownTimeout(timeout.toInt())}", style = MaterialTheme.typography.labelLarge)
             Slider(value = timeout, onValueChange = { timeout = it },
                 onValueChangeFinished = { onShutdownSecondsSelected(timeout.toInt()) },
@@ -768,6 +780,13 @@ private fun ConfigurationPanel(
 private fun formatShutdownTimeout(seconds: Int): String {
     return if (seconds < 60) "$seconds SEC" else "${seconds / 60} MIN"
 }
+
+/* Higher app-facing sensitivity means a lower MAT press threshold. */
+private fun touchSensitivityFromThreshold(threshold: Int): Int =
+    (1000 - threshold.coerceIn(50, 1000)).coerceIn(100, 1000)
+
+private fun touchThresholdFromSensitivity(sensitivity: Int): Int =
+    (1000 - sensitivity.coerceIn(100, 1000)).coerceIn(50, 1000)
 
 @Composable
 private fun ModePreviewPanel(mode: GamrMode, info: GamrDeviceInfo, matRows: List<Int>, onBack: () -> Unit) {
