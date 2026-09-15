@@ -372,6 +372,7 @@ private fun GamrHomeScreen(
                     ConnectedView.CONFIGURATION -> item {
                         ConfigurationPanel(
                             device = connectedDevice,
+                            status = connectionStatus,
                             info = deviceInfo,
                             onBack = { connectedView = ConnectedView.DASHBOARD },
                             onModeSelected = { mode ->
@@ -657,6 +658,7 @@ private fun BackButton(label: String, onClick: () -> Unit) {
 @Composable
 private fun ConfigurationPanel(
     device: GamrDevice,
+    status: String,
     info: GamrDeviceInfo,
     onBack: () -> Unit,
     onModeSelected: (GamrMode) -> Unit,
@@ -686,6 +688,8 @@ private fun ConfigurationPanel(
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             BackButton(label = "BACK TO DASHBOARD", onClick = onBack)
             Text("CONFIGURATION", style = MaterialTheme.typography.headlineSmall)
+            Text(status, style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("DEVICE NAME", style = MaterialTheme.typography.labelLarge)
             OutlinedTextField(
                 value = nameDraft,
@@ -790,8 +794,6 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
     val active = (0..8).map { zone -> zonePressed(zone, rows) }
     val outerZones = active.toMutableList().also { it[4] = false }
     val centerActive = (1..3).any { row -> rowPressed(rows, row, 2) }
-    val l3Active = (1..3).any { row -> rowPressed(rows, row, 1) }
-    val r3Active = (1..3).any { row -> rowPressed(rows, row, 3) }
     val keyboard = profile == GamrInputProfile.KEYBOARD
     val labels = if (keyboard) {
         listOf("ESC", "UP", "BKSP", "LEFT", "", "RIGHT", "TAB", "DOWN", "SPACE")
@@ -812,11 +814,6 @@ private fun GamrMatPreview(rows: List<Int>, profile: GamrInputProfile) {
             if (keyboard) {
                 MatImageOverlayCell(centerActive, 0.45f, 0.40f, 0.10f, 0.25f,
                     maxWidth, maxHeight, GamrPurple, "ENTER")
-            } else {
-                MatImageOverlayCell(l3Active, 0.32f, 0.40f, 0.16f, 0.25f,
-                    maxWidth, maxHeight, GamrPurple, "L3")
-                MatImageOverlayCell(r3Active, 0.52f, 0.40f, 0.16f, 0.25f,
-                    maxWidth, maxHeight, GamrPurple, "R3")
             }
         }
     }
@@ -992,8 +989,6 @@ private fun gamrActions(rows: List<Int>): List<String> {
         if ((1..3).any { cell(0, it) }) add("Up")
         if (cell(0, 4)) add("A")
         if ((1..3).any { cell(it, 0) }) add("Left")
-        if ((1..3).any { cell(it, 1) }) add("L3")
-        if ((1..3).any { cell(it, 3) }) add("R3")
         if ((1..3).any { cell(it, 4) }) add("Right")
         if (cell(4, 0)) add("Y")
         if ((1..3).any { cell(4, it) }) add("Down")
