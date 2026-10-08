@@ -358,9 +358,12 @@ class GamrBleClient(
                 return
             }
             if (descriptor.characteristic.uuid == DEBUG_MAT_FRAME_UUID &&
-                status == BluetoothGatt.GATT_SUCCESS && startControlResultNotifications()) {
-                reportStatus("Enabling configuration results…")
-                return
+                status == BluetoothGatt.GATT_SUCCESS) {
+                requestCurrentMatFrame(gatt)
+                if (startControlResultNotifications()) {
+                    reportStatus("Enabling configuration results…")
+                    return
+                }
             }
             connectionReady = true
             reportStatus(if (descriptor.characteristic.uuid == CONTROL_CHARACTERISTIC_UUID &&
@@ -1012,6 +1015,15 @@ class GamrBleClient(
         value: ByteArray,
         status: Int,
     ) {
+        /* A post-subscription frame read is not part of the setup read queue. */
+        if (characteristicUuid == DEBUG_MAT_FRAME_UUID &&
+            nextReadIndex >= pendingReads.size) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                updateDeviceInfo(characteristicUuid, value)
+            }
+            return
+        }
+
         if (status != BluetoothGatt.GATT_SUCCESS) {
             if (isEncryptedCharacteristic(characteristicUuid)) {
                 reportStatus("Securing GAMR connection…")
@@ -1131,6 +1143,17 @@ class GamrBleClient(
             descriptor,
             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
         )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestCurrentMatFrame(target: BluetoothGatt) {
+        val characteristic = target.getService(DEBUG_SERVICE_UUID)
+            ?.getCharacteristic(DEBUG_MAT_FRAME_UUID) ?: return
+        try {
+            target.readCharacteristic(characteristic)
+        } catch (_: SecurityException) {
+            // The notification subscription remains active; the next frame will still arrive.
+        }
     }
 
     @SuppressLint("MissingPermission")
