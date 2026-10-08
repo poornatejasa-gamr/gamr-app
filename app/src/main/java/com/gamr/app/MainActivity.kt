@@ -343,7 +343,7 @@ private fun GamrHomeScreen(
                 when (connectedView) {
                     ConnectedView.DASHBOARD -> {
                         item { Spacer(Modifier.height(6.dp)) }
-                        item { GamrHero(connectionStatus == "Connected") }
+                        item { GamrHero(true) }
                         item {
                             ConnectedDashboard(
                                 device = connectedDevice,
